@@ -1,0 +1,1565 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>THE SUBSTATION — 變電所</title>
+<!--
+════════════════════════════════════════════════════════════════
+SPEC（gamedev-feel §1 階段 A：規格推導）
+════════════════════════════════════════════════════════════════
+A1 角色規格表
+  玩家     走 2.6 / 跑 5.0 / 蹲 1.3　體力 100（跑步 -18/s，回復 +12/s）
+           手電筒電量 100（開 -1.2%/s，關 +0.4%/s），低於 20% 隨機閃爍
+  STALKER  速度 4.5（玩家跑速的 0.9 倍）
+           聽覺半徑：走 8 / 跑 20 / 蹲 3　視覺錐體 70 度 × 18
+           失去目標後朝最後已知位置搜索 10 秒，逐步擴大，逾時回巡邏
+  互動體 3 種：保險絲 ×5（目標）／電池 ×6（資源）／置物櫃 ×8（躲藏）
+
+A2 場景規格
+  15×15 網格迷宮，格距 4 單位（60×60），牆高 3.2
+  遞迴回溯生成後打通 18% 的牆製造環路（死路不利於追逐）
+  佈景 5 類：管線 / 電箱 / 木箱 / 吊燈（固定微光源）/ 血跡貼花
+  出口需集滿 5 個保險絲才能開啟
+
+A3 手感數值表
+  加速 0.25s（lerp）／減速 0.15s　相機 lerp 0.15　視角靈敏度 0.0022 rad/px
+  手電筒延遲跟隨 lerp 0.18　走路晃動幅度 0.035
+  受擊：時間縮放 0.05 × 60ms、震動 0.35 衰減 0.88、螢幕邊緣紅暈
+
+A4 事件音效表（21 項，涵蓋八大類）
+  [1玩家動作] footWalk, footRun, footCrouch, breath
+  [2互動發起] lightToggle, interact, lockerEnter
+  [3成立回饋] fuseGet, batteryGet, doorUnlock
+  [4負回饋]   doorLocked, batteryEmpty, lightDead
+  [5破壞/狀態] lockerShut, stalkerLose
+  [6玩家危機] caught, stalkerRoar
+  [7UI流程]   uiClick, gameOver, victory
+  [8環境循環] ambientBed, pipeDrip, heartbeat, distantStep
+
+A5 流程與 HUD
+  開始 → 探索（無威脅） → STALKER 甦醒 → 追逐/躲藏 → 集滿 → 逃脫
+  HUD 極簡：電量弧、體力弧、保險絲計數。血量以螢幕暗角表達，不顯示數字
+  不顯示 STALKER 位置或距離（會消滅不確定性）
+  恐懼曲線：前 150 秒無威脅；甦醒後爆點間隔 ≥ 90 秒；每次脫離後 40 秒安全期
+════════════════════════════════════════════════════════════════
+-->
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;overscroll-behavior:none;background:#05060a;
+    font-family:ui-sans-serif,-apple-system,"PingFang TC","Noto Sans TC",system-ui,sans-serif;
+    color:#c8ccd4;-webkit-font-smoothing:antialiased}
+  canvas{display:block;touch-action:none}
+  canvas,.tz{touch-action:none;-webkit-user-select:none;user-select:none;
+    -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+  :root{--sat:env(safe-area-inset-top,0px);--sar:env(safe-area-inset-right,0px);
+        --sab:env(safe-area-inset-bottom,0px);--sal:env(safe-area-inset-left,0px)}
+  #hud{position:fixed;inset:0;pointer-events:none;z-index:10}
+  #overlay{position:fixed;inset:0;pointer-events:none;z-index:30}
+  #touch{position:fixed;inset:0;display:none;pointer-events:none;z-index:20}
+  #touch.on{display:block}
+
+  /* ── 極簡 HUD（§7）── */
+  #gauges{position:absolute;left:calc(20px + var(--sal));bottom:calc(20px + var(--sab));
+    display:flex;gap:14px;align-items:flex-end}
+  .gauge{width:52px;height:52px;position:relative}
+  .gauge svg{transform:rotate(-135deg)}
+  .gauge .bg{stroke:rgba(200,204,212,.13)}
+  .gauge .fg{transition:stroke-dashoffset .18s linear}
+  .gauge i{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-size:16px;font-style:normal;opacity:.75}
+  #fuseBox{position:absolute;right:calc(20px + var(--sar));bottom:calc(20px + var(--sab));
+    display:flex;gap:5px;align-items:center}
+  .fz{width:11px;height:22px;border-radius:2px;border:1.5px solid rgba(200,204,212,.3)}
+  .fz.on{background:#e8c05a;border-color:#e8c05a;box-shadow:0 0 10px rgba(232,192,90,.7)}
+  #fuseTxt{font-size:10px;letter-spacing:.2em;opacity:.5;margin-right:6px}
+
+  #vig{position:absolute;inset:0;pointer-events:none;
+    background:radial-gradient(ellipse at center,transparent 40%,rgba(0,0,0,.74) 100%)}
+  #hurt{position:absolute;inset:0;opacity:0;pointer-events:none;
+    background:radial-gradient(ellipse at center,transparent 40%,rgba(150,20,20,.85) 100%)}
+  #hint{position:absolute;left:50%;top:62%;transform:translateX(-50%);
+    font-size:13px;letter-spacing:.1em;opacity:0;transition:opacity .2s;
+    text-shadow:0 2px 8px #000;white-space:nowrap}
+  #msg{position:absolute;left:50%;top:38%;transform:translate(-50%,-50%);
+    font-size:22px;letter-spacing:.22em;opacity:0;text-align:center;
+    text-shadow:0 2px 14px #000;white-space:pre-line}
+  #flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none}
+
+  /* ── 覆蓋層 ── */
+  .screen{position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:18px;pointer-events:auto;
+    background:radial-gradient(ellipse at center,#0d1016 0%,#05060a 70%)}
+  .screen.hidden{display:none}
+  .screen h1{font-size:46px;font-weight:200;letter-spacing:.42em;color:#dfe4ec;
+    text-indent:.42em;text-shadow:0 0 30px rgba(120,150,190,.35)}
+  .screen h2{font-size:12px;letter-spacing:.5em;opacity:.4;margin-top:-10px;text-indent:.5em}
+  .keys{display:grid;grid-template-columns:auto auto;gap:6px 18px;font-size:13px;opacity:.7}
+  .keys b{font-weight:600;background:rgba(200,204,212,.1);border-radius:4px;
+    padding:2px 8px;text-align:center;font-size:12px}
+  .btn{pointer-events:auto;cursor:pointer;border:1px solid rgba(200,204,212,.3);
+    background:rgba(200,204,212,.06);color:#dfe4ec;border-radius:2px;
+    padding:13px 44px;font-size:13px;font-weight:600;letter-spacing:.3em;
+    text-indent:.3em;font-family:inherit;transition:background .15s,border-color .15s}
+  .btn:hover{background:rgba(200,204,212,.14);border-color:rgba(200,204,212,.55)}
+  .lore{font-size:12.5px;opacity:.45;max-width:390px;text-align:center;line-height:1.9}
+  .stats{font-size:12px;opacity:.5;letter-spacing:.16em;line-height:2}
+  #loadTxt{font-size:11px;letter-spacing:.3em;opacity:.45}
+  .toggles{display:flex;gap:9px;margin-top:2px}
+  .tg{pointer-events:auto;cursor:pointer;border:1px solid rgba(200,204,212,.22);
+    background:transparent;color:#c8ccd4;border-radius:2px;padding:7px 14px;
+    font:600 11px inherit;letter-spacing:.14em;opacity:.6}
+  .tg.on{background:rgba(200,204,212,.16);opacity:1;border-color:rgba(200,204,212,.5)}
+
+  /* ── 觸控層（gamedev-mobile）── */
+  .tz{position:absolute;pointer-events:auto}
+  #tzMove{left:0;top:0;width:46%;height:100%}
+  #tzLook{right:0;top:0;width:54%;height:100%}
+  #stick{position:absolute;width:122px;height:122px;margin:-61px 0 0 -61px;
+    border-radius:50%;border:2px solid rgba(200,204,212,.4);
+    background:rgba(200,204,212,.05);opacity:0;transition:opacity .12s;pointer-events:none}
+  #stick.on{opacity:1}
+  #knob{position:absolute;left:50%;top:50%;width:50px;height:50px;margin:-25px 0 0 -25px;
+    border-radius:50%;background:rgba(200,204,212,.55)}
+  .tbtn{position:absolute;pointer-events:auto;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;text-align:center;
+    font-weight:600;letter-spacing:.06em;color:#dfe4ec;line-height:1.15;
+    background:rgba(20,24,32,.6);border:1.5px solid rgba(200,204,212,.32);
+    -webkit-user-select:none;user-select:none;touch-action:none;
+    transition:transform .07s,background .07s}
+  .tbtn.press{transform:scale(.94);background:rgba(200,204,212,.28)}
+  .tbtn.active{border-color:rgba(232,192,90,.8);color:#e8c05a}
+  #bLight{right:calc(20px + var(--sar));bottom:calc(96px + var(--sab) + 20px);
+    width:74px;height:74px;font-size:11px}
+  #bRun{right:calc(104px + var(--sar));bottom:calc(70px + var(--sab) + 20px);
+    width:60px;height:60px;font-size:11px}
+  #bCrouch{right:calc(30px + var(--sar));bottom:calc(22px + var(--sab) + 20px);
+    width:60px;height:60px;font-size:11px}
+  #bUse{right:calc(112px + var(--sar));bottom:calc(150px + var(--sab) + 20px);
+    width:64px;height:64px;font-size:11px;opacity:0;transition:opacity .15s}
+  #bUse.show{opacity:1}
+  #bPause{left:calc(14px + var(--sal));top:calc(14px + var(--sat));
+    width:44px;height:44px;font-size:14px;border-radius:8px}
+  body.touch #gauges{bottom:calc(20px + var(--sab));left:calc(70px + var(--sal))}
+  @media (max-height:430px){
+    body.touch .screen h1{font-size:28px}
+    body.touch .screen h2{font-size:10px}
+    body.touch .lore{font-size:11px;max-width:320px;line-height:1.7}
+    body.touch .keys{font-size:11px}
+  }
+  #rot{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+    flex-direction:column;gap:14px;background:#05060a;z-index:99;
+    font-size:15px;letter-spacing:.2em;text-align:center;padding:30px}
+  #rot.on{display:flex}
+  #rotIcon{width:50px;height:80px;border:3px solid rgba(200,204,212,.5);border-radius:9px;
+    animation:tilt 1.8s ease-in-out infinite}
+  @keyframes tilt{0%,42%{transform:rotate(0)}58%,100%{transform:rotate(-90deg)}}
+</style>
+</head>
+<body>
+<div id="rot"><div id="rotIcon"></div>請將裝置轉為橫向</div>
+
+<div id="hud">
+  <div id="vig"></div><div id="hurt"></div><div id="flash"></div>
+  <div id="gauges">
+    <div class="gauge"><svg viewBox="0 0 40 40" width="52" height="52">
+      <circle class="bg" cx="20" cy="20" r="16" fill="none" stroke-width="2.5"
+        stroke-dasharray="75.4 100.5" />
+      <circle class="fg" id="gLight" cx="20" cy="20" r="16" fill="none" stroke="#e8c05a"
+        stroke-width="2.5" stroke-linecap="round" stroke-dasharray="75.4 100.5" stroke-dashoffset="0"/>
+    </svg><i>◐</i></div>
+    <div class="gauge"><svg viewBox="0 0 40 40" width="52" height="52">
+      <circle class="bg" cx="20" cy="20" r="16" fill="none" stroke-width="2.5"
+        stroke-dasharray="75.4 100.5" />
+      <circle class="fg" id="gStam" cx="20" cy="20" r="16" fill="none" stroke="#7fa8d0"
+        stroke-width="2.5" stroke-linecap="round" stroke-dasharray="75.4 100.5" stroke-dashoffset="0"/>
+    </svg><i>◍</i></div>
+  </div>
+  <div id="fuseBox"><span id="fuseTxt">FUSE</span></div>
+  <div id="hint"></div>
+  <div id="msg"></div>
+</div>
+
+<div id="touch">
+  <div class="tz" id="tzMove"></div><div class="tz" id="tzLook"></div>
+  <div id="stick"><div id="knob"></div></div>
+  <div class="tbtn" id="bLight">燈</div>
+  <div class="tbtn" id="bRun">跑</div>
+  <div class="tbtn" id="bCrouch">蹲</div>
+  <div class="tbtn" id="bUse">互動</div>
+  <div class="tbtn" id="bPause">II</div>
+</div>
+
+<div id="overlay">
+  <div class="screen" id="loadScreen"><h1>THE SUBSTATION</h1><h2>變電所</h2>
+    <div id="loadTxt">LOADING</div></div>
+
+  <div class="screen hidden" id="startScreen">
+    <h1>THE SUBSTATION</h1><h2>變電所</h2>
+    <div class="lore">停電後你被派來重啟地下變電所。<br>
+      五個保險絲散落在通道裡。<br>
+      找齊它們，然後離開。<br><br>
+      這裡不只有你。</div>
+    <div class="keys" id="keyList">
+      <b>W A S D</b><span>移動</span>
+      <b>滑鼠</b><span>環顧</span>
+      <b>Shift</b><span>奔跑（會發出聲音）</span>
+      <b>Ctrl</b><span>蹲下（更安靜）</span>
+      <b>F</b><span>手電筒</span>
+      <b>E</b><span>互動 / 躲藏</span>
+      <b>Esc</b><span>暫停</span>
+    </div>
+    <button class="btn" id="startBtn">ENTER</button>
+    <div class="stats" id="bestLine"></div>
+  </div>
+
+  <div class="screen hidden" id="pauseScreen"><h1>PAUSED</h1>
+    <div class="toggles">
+      <button class="tg on" id="tgHaptic">震動</button>
+      <button class="tg on" id="tgFlicker">畫面閃爍</button>
+      <button class="tg" id="tgInvert">反轉 Y</button>
+    </div>
+    <div class="stats" style="pointer-events:auto">靈敏度
+      <input id="sens" type="range" min="8" max="45" value="22" style="vertical-align:middle;width:130px"></div>
+    <button class="btn" id="resumeBtn">RESUME</button>
+    <button class="btn" id="restartBtn2">RESTART</button>
+  </div>
+
+  <div class="screen hidden" id="overScreen"><h1 id="overTitle">CAUGHT</h1>
+    <h2 id="overSub"></h2><div class="stats" id="overStats"></div>
+    <button class="btn" id="restartBtn">RETRY</button></div>
+</div>
+
+<script type="importmap">
+{"imports":{"three":"https://unpkg.com/three@0.180.0/build/three.module.js",
+"three/addons/":"https://unpkg.com/three@0.180.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ═══════════════════════════════════════════════════
+   CONFIG
+   ═══════════════════════════════════════════════════ */
+const CONFIG = {
+  PAL:{ bg:0x05060a, body:0x2a2f38, accent:0xe8c05a, danger:0x8e2020, high:0xdfe4ec },
+  GRID:15, CELL:4, WALL_H:3.2, LOOP:0.18,
+  PLAYER:{ walk:2.6, run:5.0, crouch:1.3, eye:1.62, eyeCrouch:0.95,
+           accel:0.25, decel:0.15, stamina:100, staminaDrain:18, staminaRegen:12 },
+  LIGHT:{ angle:0.52, intensity:42, dist:32, penumbra:0.6,
+          drain:1.2, regen:0.4, lowAt:20, lerp:0.18 },
+  CAM:{ lerp:0.15, bob:0.035, fov:72, fovRun:80 },
+  FEEL:{ hitStop:0.05, hitStopMs:60, shake:0.35, shakeDecay:0.88 },
+  STALKER:{ speed:4.5, hearWalk:8, hearRun:20, hearCrouch:3,
+            visAngle:70, visDist:18, memory:10, catchDist:1.5,
+            wakeAtSec:150, wakeAtFuses:2, calmAfterEscape:40, minPeakGap:90 },
+  FUSES:5, BATTERIES:6, LOCKERS:8,
+};
+const PAL=CONFIG.PAL;
+const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const lerp=(a,b,t)=>a+(b-a)*t;
+const rand=(a,b)=>a+Math.random()*(b-a);
+const easeOutCubic=t=>1-Math.pow(1-t,3);
+
+/* ── 儲存安全外殼（gamedev-3d §1：沙箱為不透明來源）── */
+const Store=(()=>{
+  let ls=null;
+  try{ localStorage.setItem('__ts','1'); localStorage.removeItem('__ts'); ls=localStorage; }catch(_){ ls=null; }
+  const mem=new Map();
+  return { get(k){ try{ return ls?ls.getItem(k):(mem.has(k)?mem.get(k):null); }catch(_){ return null; } },
+           set(k,v){ try{ if(ls){ls.setItem(k,String(v));}else{mem.set(k,String(v));} }catch(_){ mem.set(k,String(v)); } } };
+})();
+
+/* ── 裝置分級（gamedev-mobile §7）── */
+const DEV=(()=>{
+  const coarse=matchMedia('(pointer: coarse)').matches;
+  const low=coarse&&(navigator.hardwareConcurrency||4)<=4;
+  return { touch:coarse, low, pixelCap:low?1.5:2,
+    shadowSize:coarse?(low?512:1024):2048, spotShadow:!low,
+    particles:coarse?(low?0:90):220, post:!coarse };
+})();
+if(DEV.touch) document.body.classList.add('touch');
+
+/* ── 觸覺回饋三層降級（gamedev-mobile §5）── */
+const Haptics=(()=>{
+  const cap=(window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.Haptics)||null;
+  const web=typeof navigator.vibrate==='function';
+  let enabled=Store.get('ts_haptic')!=='0', last=0;
+  const MAP={ uiTap:{impact:'Light',pattern:4}, pickup:{impact:'Light',pattern:8},
+    toggle:{impact:'Light',pattern:6}, unlock:{notify:'SUCCESS',pattern:[14,32,22]},
+    fail:{notify:'WARNING',pattern:[8,40,8]}, hide:{impact:'Medium',pattern:12},
+    near:{impact:'Medium',pattern:14}, caught:{impact:'Heavy',pattern:[24,40,24]},
+    scare:{impact:'Heavy',pattern:[10,26,18]}, victory:{notify:'SUCCESS',pattern:[12,60,12,60,20]},
+    gameOver:{notify:'ERROR',pattern:[40,60,40,60,80]} };
+  function fire(n){
+    if(!enabled||!DEV.touch) return;
+    const s=MAP[n]; if(!s) return;
+    const now=performance.now(); if(now-last<40) return; last=now;
+    try{ if(cap){ if(s.impact) cap.impact({style:s.impact}); else if(s.notify) cap.notification({type:s.notify}); }
+         else if(web) navigator.vibrate(s.pattern); }catch(_){}
+  }
+  return { fire, get enabled(){return enabled;}, set enabled(v){ enabled=v; Store.set('ts_haptic',v?'1':'0'); },
+           get available(){ return !!(cap||web); } };
+})();
+
+/* ═══════════════════════════════════════════════════
+   §A 音訊（gamedev-feel §3 / gamedev-horror §3 五層）
+   ═══════════════════════════════════════════════════ */
+const Snd=(()=>{
+  let ctx=null,master=null,bus={},ready=false;
+  const voices={};
+  function init(){
+    if(ctx) return;
+    ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const comp=ctx.createDynamicsCompressor();
+    comp.threshold.value=-16; comp.ratio.value=8; comp.attack.value=0.004; comp.release.value=0.25;
+    master=ctx.createGain(); master.gain.value=0.9;
+    master.connect(comp); comp.connect(ctx.destination);
+    for(const k of ['sfx','ui','amb','threat']){
+      const g=ctx.createGain();
+      g.gain.value=k==='amb'?0.55:(k==='ui'?0.5:1.0);
+      g.connect(master); bus[k]=g;
+    }
+    ready=true;
+  }
+  const resume=()=>{ init(); if(ctx.state==='suspended') ctx.resume(); };
+  function nb(sec){ const n=Math.max(1,(ctx.sampleRate*sec)|0);
+    const b=ctx.createBuffer(1,n,ctx.sampleRate),d=b.getChannelData(0);
+    for(let i=0;i<n;i++) d[i]=Math.random()*2-1; return b; }
+  function env(g,t,peak,a=0.005,d=0.05,r=0.06){
+    const p=Math.max(0.0002,peak);
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(p,t+a);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0001,p*0.34),t+a+d);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+a+d+r);
+  }
+  function limit(k){ const a=voices[k]||(voices[k]=[]); const n=ctx.currentTime;
+    while(a.length&&a[0]<n) a.shift(); if(a.length>=4) return false; a.push(n+0.4); return true; }
+  const jit=()=>1+(Math.random()*0.16-0.08);
+  function osc(type,f0,f1,dur,peak,b,t,dt=0){
+    const o=ctx.createOscillator(),g=ctx.createGain();
+    o.type=type; o.frequency.setValueAtTime(f0,t);
+    if(f1!==f0) o.frequency.exponentialRampToValueAtTime(Math.max(18,f1),t+dur);
+    if(dt) o.detune.value=dt;
+    env(g,t,peak,0.005,dur*0.32,dur*0.62);
+    o.connect(g); g.connect(bus[b]||bus.sfx); o.start(t); o.stop(t+dur+0.08);
+  }
+  function noise(dur,peak,b,t,{type='lowpass',f0=2200,f1=300,Q=1}={}){
+    const s=ctx.createBufferSource(); s.buffer=nb(dur+0.05);
+    const f=ctx.createBiquadFilter(); f.type=type; f.Q.value=Q;
+    f.frequency.setValueAtTime(f0,t); f.frequency.exponentialRampToValueAtTime(Math.max(28,f1),t+dur);
+    const g=ctx.createGain(); env(g,t,peak,0.004,dur*0.3,dur*0.6);
+    s.connect(f); f.connect(g); g.connect(bus[b]||bus.sfx); s.start(t); s.stop(t+dur+0.08);
+  }
+  const R={
+    /* [1] 玩家動作 */
+    footWalk(t){ noise(0.07,0.13,'sfx',t,{type:'bandpass',f0:430*jit(),f1:280,Q:1.7}); },
+    footRun(t){ noise(0.08,0.26,'sfx',t,{type:'bandpass',f0:560*jit(),f1:300,Q:1.5});
+                osc('sine',72,48,0.07,0.16,'sfx',t); },
+    footCrouch(t){ noise(0.06,0.05,'sfx',t,{type:'bandpass',f0:330*jit(),f1:220,Q:2.0}); },
+    breath(t){ noise(0.34,0.10,'sfx',t,{type:'bandpass',f0:620,f1:340,Q:0.9}); },
+    /* [2] 互動發起 */
+    lightToggle(t){ osc('square',1400,900,0.035,0.16,'sfx',t); osc('square',700,520,0.04,0.10,'sfx',t+0.035); },
+    interact(t){ noise(0.09,0.16,'sfx',t,{type:'highpass',f0:2400,f1:1100,Q:1.1}); },
+    lockerEnter(t){ noise(0.16,0.22,'sfx',t,{type:'bandpass',f0:900,f1:260,Q:1.2});
+                    osc('sawtooth',180,90,0.2,0.16,'sfx',t+0.04); },
+    /* [3] 成立回饋 */
+    fuseGet(t){ [660,880,1320].forEach((f,i)=>osc('square',f,f,0.17,0.18,'sfx',t+i*0.055)); },
+    batteryGet(t){ [520,780].forEach((f,i)=>osc('triangle',f,f,0.13,0.15,'sfx',t+i*0.05)); },
+    doorUnlock(t){ osc('sawtooth',150,80,0.5,0.26,'sfx',t);
+                   noise(0.4,0.2,'sfx',t+0.05,{f0:1400,f1:200});
+                   [392,523,659,784].forEach((f,i)=>osc('sine',f,f,0.8,0.13,'ui',t+0.25+i*0.11)); },
+    /* [4] 負回饋 */
+    doorLocked(t){ osc('square',260,200,0.11,0.2,'sfx',t); noise(0.09,0.14,'sfx',t,{type:'bandpass',f0:700,f1:300,Q:2}); },
+    batteryEmpty(t){ osc('square',400,320,0.16,0.18,'ui',t); },
+    lightDead(t){ osc('sawtooth',300,60,0.3,0.2,'sfx',t); },
+    /* [5] 破壞 / 狀態 */
+    lockerShut(t){ noise(0.13,0.3,'sfx',t,{type:'bandpass',f0:1100,f1:200,Q:1.1});
+                   osc('sine',95,55,0.16,0.24,'sfx',t); },
+    stalkerLose(t){ osc('sine',140,70,0.7,0.14,'threat',t); },
+    /* [6] 玩家危機 */
+    caught(t){ osc('sawtooth',420,60,0.7,0.5,'threat',t);
+               noise(0.6,0.4,'threat',t,{f0:2600,f1:120});
+               osc('sine',60,34,0.9,0.45,'threat',t+0.05); },
+    stalkerRoar(t){
+      const o=ctx.createOscillator(),g=ctx.createGain(),f=ctx.createBiquadFilter();
+      o.type='sawtooth'; o.frequency.setValueAtTime(rand(88,120),t);
+      o.frequency.exponentialRampToValueAtTime(rand(46,70),t+0.9);
+      f.type='lowpass'; f.frequency.value=520; f.Q.value=4;
+      env(g,t,0.4,0.06,0.35,0.5);
+      o.connect(f); f.connect(g); g.connect(bus.threat); o.start(t); o.stop(t+1.0);
+      noise(0.8,0.14,'threat',t+0.06,{type:'bandpass',f0:300,f1:110,Q:1.4});
+    },
+    /* [7] UI 流程 */
+    uiClick(t){ osc('square',900,900,0.035,0.14,'ui',t); },
+    gameOver(t){ [330,262,220,165].forEach((f,i)=>osc('sawtooth',f,f,1.5,0.2,'ui',t+i*0.22)); },
+    victory(t){ [262,330,392,523].forEach((f,i)=>osc('sine',f,f,1.6,0.2,'ui',t+i*0.16)); },
+    /* [8] 環境循環 */
+    pipeDrip(t){ osc('sine',rand(900,1500),rand(400,700),0.10,0.10,'amb',t); },
+    distantStep(t){ noise(0.1,0.07,'amb',t,{type:'bandpass',f0:380,f1:210,Q:2.2}); },
+  };
+  function play(n,d=0){ if(!ready) return; if(!limit(n)) return;
+    const f=R[n]; if(!f) return; try{ f(ctx.currentTime+d); }catch(_){} }
+
+  /* 環境底噪：持續低頻，爆點前淡出（§3「突然的安靜」）*/
+  let bed=null,bedGain=null;
+  function startBed(){
+    if(!ready||bed) return;
+    const s=ctx.createBufferSource(); s.buffer=nb(4); s.loop=true;
+    const f=ctx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=180;
+    bedGain=ctx.createGain(); bedGain.gain.value=0.05;
+    const lfo=ctx.createOscillator(),lg=ctx.createGain();
+    lfo.frequency.value=0.07; lg.gain.value=0.018; lfo.connect(lg); lg.connect(bedGain.gain); lfo.start();
+    s.connect(f); f.connect(bedGain); bedGain.connect(bus.amb); s.start(); bed=s;
+  }
+  function bedTo(v,sec){ if(!bedGain) return;
+    const t=ctx.currentTime; bedGain.gain.cancelScheduledValues(t);
+    bedGain.gain.setValueAtTime(Math.max(0.0001,bedGain.gain.value),t);
+    bedGain.gain.exponentialRampToValueAtTime(Math.max(0.0001,v),t+sec); }
+  /* 手電筒嗡鳴 */
+  let hum=null,humGain=null;
+  function humOn(on){
+    if(!ready) return;
+    if(!hum){ const o=ctx.createOscillator(); o.type='triangle'; o.frequency.value=118;
+      humGain=ctx.createGain(); humGain.gain.value=0; o.connect(humGain); humGain.connect(bus.amb); o.start(); hum=o; }
+    humGain.gain.setTargetAtTime(on?0.018:0.0001, ctx.currentTime, 0.12);
+  }
+  /* 心跳：頻率隨危險度 1.0 → 2.2Hz */
+  let hbT=0;
+  function tick(dt,danger,moving,crouch,running){
+    if(!ready) return;
+    hbT-=dt;
+    if(danger>0.05&&hbT<=0){
+      const hz=lerp(1.0,2.2,clamp(danger,0,1));
+      osc('sine',56,32,0.15,0.16+danger*0.3,'amb',ctx.currentTime);
+      hbT=1/hz;
+    }
+    if(Math.random()<dt*0.10) play('pipeDrip');
+  }
+  return { init,resume,play,startBed,bedTo,humOn,tick, get ready(){return ready;},
+           get t(){ return ctx?ctx.currentTime:0; } };
+})();
+
+/* ═══════════════════════════════════════════════════
+   §B 渲染器 / 場景（gamedev-3d §4）
+   ═══════════════════════════════════════════════════ */
+const renderer=new THREE.WebGLRenderer({antialias:!DEV.low,powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio,DEV.pixelCap));
+renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=DEV.low?THREE.PCFShadowMap:THREE.PCFSoftShadowMap;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=0.95;
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(PAL.bg);
+scene.fog=new THREE.FogExp2(0x070a12,0.048);      // 封閉空間，遠處近乎全黑
+
+const camera=new THREE.PerspectiveCamera(CONFIG.CAM.fov,innerWidth/innerHeight,0.05,120);
+
+/* 位移與視線分離（gamedev-3d §1）：player 管 XZ，camera 管眼高與視線 */
+const player=new THREE.Object3D();
+scene.add(player); player.add(camera);
+camera.position.set(0,CONFIG.PLAYER.eye,0);
+
+/* ── 環境貼圖：沒有它金屬會全黑（gamedev-3d §4）── */
+(function buildEnv(){
+  const pm=new THREE.PMREMGenerator(renderer);
+  const es=new THREE.Scene();
+  es.add(new THREE.Mesh(new THREE.SphereGeometry(40,16,12),
+    new THREE.MeshBasicMaterial({color:0x0b0e15,side:THREE.BackSide})));
+  const g=new THREE.Mesh(new THREE.PlaneGeometry(120,120),
+    new THREE.MeshBasicMaterial({color:0x0e1118}));
+  g.rotation.x=-Math.PI/2; g.position.y=-2; es.add(g);
+  const lamp=new THREE.Mesh(new THREE.SphereGeometry(3,10,8),
+    new THREE.MeshBasicMaterial({color:0x30384a}));
+  lamp.position.set(6,14,4); es.add(lamp);
+  scene.environment=pm.fromScene(es,0.03).texture;
+  scene.environmentIntensity=0.30;                 // 恐怖場景更低
+  pm.dispose();
+})();
+
+/* ── 四盞燈：恐怖場景全部壓到極低，光靠手電筒（§5 §2）── */
+const key=new THREE.DirectionalLight(0x9fb4d8,0.34);
+key.position.set(8,16,6); scene.add(key);
+const fill=new THREE.DirectionalLight(0x4a5a78,0.14); fill.position.set(-8,6,-6); scene.add(fill);
+const rim=new THREE.DirectionalLight(0x2c3850,0.18); rim.position.set(-4,4,-10); scene.add(rim);
+scene.add(new THREE.HemisphereLight(0x2a3a4e,0x131922,0.55));
+
+/* ── 手電筒（gamedev-horror §2）── */
+const torch=new THREE.SpotLight(0xfff0cc,0,CONFIG.LIGHT.dist,CONFIG.LIGHT.angle,CONFIG.LIGHT.penumbra,0.9);
+torch.castShadow=DEV.spotShadow;
+torch.shadow.mapSize.set(DEV.shadowSize,DEV.shadowSize);
+torch.shadow.camera.near=0.2; torch.shadow.camera.far=CONFIG.LIGHT.dist+2;
+torch.shadow.bias=-0.0018; torch.shadow.normalBias=0.03;
+camera.add(torch); camera.add(torch.target);
+torch.position.set(0.05,-0.05,0); torch.target.position.set(0.05,-0.05,-1);
+
+/* ── 後製（桌機才開）── */
+let composer=null;
+if(DEV.post){
+  composer=new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene,camera));
+  composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.42,0.7,0.55));
+  composer.addPass(new OutputPass());
+}
+
+/* ═══════════════════════════════════════════════════
+   §C 程序化貼圖 ×3（低對比，避免掠角色帶）
+   ═══════════════════════════════════════════════════ */
+function concreteTex(){
+  const s=512,c=document.createElement('canvas'); c.width=c.height=s;
+  const g=c.getContext('2d');
+  g.fillStyle='#3a404a'; g.fillRect(0,0,s,s);
+  for(let i=0;i<26000;i++){
+    const v=Math.random();
+    g.fillStyle=v<0.4?'rgba(52,57,66,.26)':v<0.75?'rgba(78,85,96,.20)':'rgba(100,108,120,.14)';
+    g.fillRect(Math.random()*s,Math.random()*s,rand(1,2.4),rand(1,2.4));
+  }
+  for(let i=0;i<40;i++){                                  // 細裂縫（低對比）
+    g.strokeStyle='rgba(26,29,35,.20)'; g.lineWidth=rand(0.4,1.0);
+    let x=Math.random()*s,y=Math.random()*s; g.beginPath(); g.moveTo(x,y);
+    for(let k=0;k<7;k++){ x+=rand(-26,26); y+=rand(-26,26); g.lineTo(x,y); } g.stroke();
+  }
+  const t=new THREE.CanvasTexture(c); t.wrapS=t.wrapT=THREE.RepeatWrapping;
+  t.colorSpace=THREE.SRGBColorSpace; t.anisotropy=renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+function metalTex(){
+  const s=256,c=document.createElement('canvas'); c.width=c.height=s;
+  const g=c.getContext('2d');
+  g.fillStyle='#3a4048'; g.fillRect(0,0,s,s);
+  for(let i=0;i<900;i++){ g.strokeStyle=`rgba(${20+Math.random()*40|0},${24+Math.random()*40|0},30,.22)`;
+    g.lineWidth=rand(0.4,1.2); const y=Math.random()*s;
+    g.beginPath(); g.moveTo(0,y); g.lineTo(s,y+rand(-2,2)); g.stroke(); }
+  for(let i=0;i<180;i++){ g.fillStyle=`rgba(96,62,34,${0.05+Math.random()*0.14})`;
+    g.beginPath(); g.ellipse(Math.random()*s,Math.random()*s,rand(3,14),rand(2,10),Math.random()*3,0,7); g.fill(); }
+  const t=new THREE.CanvasTexture(c); t.wrapS=t.wrapT=THREE.RepeatWrapping;
+  t.colorSpace=THREE.SRGBColorSpace; return t;
+}
+function gridTex(){
+  const s=128,c=document.createElement('canvas'); c.width=c.height=s;
+  const g=c.getContext('2d');
+  g.fillStyle='#1a1f27'; g.fillRect(0,0,s,s);
+  g.strokeStyle='rgba(120,140,170,.16)'; g.lineWidth=1;
+  for(let i=0;i<=s;i+=16){ g.beginPath(); g.moveTo(i,0); g.lineTo(i,s); g.stroke();
+                           g.beginPath(); g.moveTo(0,i); g.lineTo(s,i); g.stroke(); }
+  const t=new THREE.CanvasTexture(c); t.wrapS=t.wrapT=THREE.RepeatWrapping;
+  t.colorSpace=THREE.SRGBColorSpace; return t;
+}
+const TEX_WALL=concreteTex(), TEX_METAL=metalTex(), TEX_GRID=gridTex();
+TEX_WALL.repeat.set(1,1); TEX_METAL.repeat.set(1,1);
+
+/* ═══════════════════════════════════════════════════
+   §D 迷宮生成
+   ═══════════════════════════════════════════════════ */
+const N=CONFIG.GRID, CELL=CONFIG.CELL;
+const cells=[];                       // {N,S,E,W} true = 有牆
+function idx(x,y){ return y*N+x; }
+function genMaze(){
+  cells.length=0;
+  for(let i=0;i<N*N;i++) cells.push({n:true,s:true,e:true,w:true,v:false});
+  const st=[{x:0,y:0}]; cells[0].v=true;
+  while(st.length){
+    const c=st[st.length-1];
+    const opts=[];
+    if(c.y>0   && !cells[idx(c.x,c.y-1)].v) opts.push('n');
+    if(c.y<N-1 && !cells[idx(c.x,c.y+1)].v) opts.push('s');
+    if(c.x<N-1 && !cells[idx(c.x+1,c.y)].v) opts.push('e');
+    if(c.x>0   && !cells[idx(c.x-1,c.y)].v) opts.push('w');
+    if(!opts.length){ st.pop(); continue; }
+    const d=opts[(Math.random()*opts.length)|0];
+    const a=cells[idx(c.x,c.y)];
+    let nx=c.x,ny=c.y;
+    if(d==='n'){ a.n=false; ny--; cells[idx(nx,ny)].s=false; }
+    if(d==='s'){ a.s=false; ny++; cells[idx(nx,ny)].n=false; }
+    if(d==='e'){ a.e=false; nx++; cells[idx(nx,ny)].w=false; }
+    if(d==='w'){ a.w=false; nx--; cells[idx(nx,ny)].e=false; }
+    cells[idx(nx,ny)].v=true; st.push({x:nx,y:ny});
+  }
+  // 打通部分牆製造環路：死路對追逐玩法不利
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++){
+    if(Math.random()<CONFIG.LOOP){
+      if(x<N-1){ cells[idx(x,y)].e=false; cells[idx(x+1,y)].w=false; }
+    }
+    if(Math.random()<CONFIG.LOOP){
+      if(y<N-1){ cells[idx(x,y)].s=false; cells[idx(x,y+1)].n=false; }
+    }
+  }
+}
+const cellToWorld=(x,y)=>new THREE.Vector3((x-(N-1)/2)*CELL,0,(y-(N-1)/2)*CELL);
+const worldToCell=(v)=>({ x:clamp(Math.round(v.x/CELL+(N-1)/2),0,N-1),
+                          y:clamp(Math.round(v.z/CELL+(N-1)/2),0,N-1) });
+function open(x,y,d){ const c=cells[idx(x,y)]; return !c[d]; }
+function neighbors(x,y){
+  const r=[];
+  if(y>0   && open(x,y,'n')) r.push({x,y:y-1});
+  if(y<N-1 && open(x,y,'s')) r.push({x,y:y+1});
+  if(x<N-1 && open(x,y,'e')) r.push({x:x+1,y});
+  if(x>0   && open(x,y,'w')) r.push({x:x-1,y});
+  return r;
+}
+function bfsNext(from,to){
+  if(from.x===to.x&&from.y===to.y) return null;
+  const prev=new Int32Array(N*N).fill(-1);
+  const q=[from]; prev[idx(from.x,from.y)]=idx(from.x,from.y);
+  let found=false;
+  while(q.length){
+    const c=q.shift();
+    if(c.x===to.x&&c.y===to.y){ found=true; break; }
+    for(const nb of neighbors(c.x,c.y)){
+      const i=idx(nb.x,nb.y);
+      if(prev[i]===-1){ prev[i]=idx(c.x,c.y); q.push(nb); }
+    }
+  }
+  if(!found) return null;
+  let cur=idx(to.x,to.y);
+  while(prev[cur]!==idx(from.x,from.y)) { cur=prev[cur]; if(cur<0) return null; }
+  return { x:cur%N, y:(cur/N)|0 };
+}
+
+/* ═══════════════════════════════════════════════════
+   §E 關卡建構
+   ═══════════════════════════════════════════════════ */
+const walls=[];               // 碰撞用線段 {x1,z1,x2,z2}
+const level=new THREE.Group(); scene.add(level);
+const lockers=[], fuses=[], batteries=[], lamps=[];
+
+const M_WALL=new THREE.MeshStandardMaterial({map:TEX_WALL,roughness:0.94,metalness:0.05});
+const M_FLOOR=new THREE.MeshStandardMaterial({map:TEX_WALL,roughness:0.98,metalness:0.02,color:0x8d939c});
+const M_CEIL=new THREE.MeshStandardMaterial({map:TEX_WALL,roughness:1.0,metalness:0,color:0x565c66});
+const M_METAL=new THREE.MeshStandardMaterial({map:TEX_METAL,roughness:0.42,metalness:0.85});
+const M_GLOW=new THREE.MeshStandardMaterial({color:PAL.accent,emissive:PAL.accent,
+  emissiveIntensity:2.4,roughness:0.3,metalness:0.2});
+const M_BLUE=new THREE.MeshStandardMaterial({color:0x7fa8d0,emissive:0x2c5580,
+  emissiveIntensity:1.8,roughness:0.35,metalness:0.3});
+
+function bevelBox(w,h,d,r=0.04){
+  const sh=new THREE.Shape(), x=-w/2, y=-h/2;
+  sh.moveTo(x+r,y); sh.lineTo(x+w-r,y); sh.quadraticCurveTo(x+w,y,x+w,y+r);
+  sh.lineTo(x+w,y+h-r); sh.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  sh.lineTo(x+r,y+h); sh.quadraticCurveTo(x,y+h,x,y+h-r);
+  sh.lineTo(x,y+r); sh.quadraticCurveTo(x,y,x+r,y);
+  const g=new THREE.ExtrudeGeometry(sh,{depth:d,bevelEnabled:true,bevelSize:0.015,
+    bevelThickness:0.015,bevelSegments:2,steps:1});
+  g.translate(0,0,-d/2); return g;
+}
+const OUTLINE_MAT=new THREE.MeshBasicMaterial({color:0x020306,side:THREE.BackSide});
+function addOutline(root,s=1.035){
+  const adds=[];
+  root.traverse(o=>{ if(o.isMesh&&o.geometry&&o.material!==OUTLINE_MAT){
+    o.geometry.computeBoundingSphere();
+    const c=o.geometry.boundingSphere.center;
+    const m=new THREE.Mesh(o.geometry,OUTLINE_MAT);
+    m.scale.setScalar(s); m.position.copy(c).multiplyScalar(1-s);  // 以幾何中心縮放
+    m.renderOrder=-1; adds.push([o,m]);
+  }});
+  adds.forEach(([o,m])=>o.add(m));
+}
+
+function buildLevel(){
+  while(level.children.length) level.remove(level.children[0]);
+  walls.length=0; lockers.length=0; fuses.length=0; batteries.length=0; lamps.length=0;
+
+  const half=N*CELL/2, TH=0.22, H=CONFIG.WALL_H;
+  const wallGeo=new THREE.BoxGeometry(1,1,1);
+  const segs=[];
+  const pushWall=(cx,cz,len,horiz)=>{
+    segs.push({cx,cz,len,horiz});
+    const hw=horiz?len/2:TH/2, hd=horiz?TH/2:len/2;
+    walls.push({x1:cx-hw,z1:cz-hd,x2:cx+hw,z2:cz+hd});
+  };
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++){
+    const c=cells[idx(x,y)], p=cellToWorld(x,y);
+    if(c.n) pushWall(p.x,p.z-CELL/2,CELL+TH,true);
+    if(c.w) pushWall(p.x-CELL/2,p.z,CELL+TH,false);
+    if(y===N-1&&c.s) pushWall(p.x,p.z+CELL/2,CELL+TH,true);
+    if(x===N-1&&c.e) pushWall(p.x+CELL/2,p.z,CELL+TH,false);
+  }
+  const inst=new THREE.InstancedMesh(wallGeo,M_WALL,segs.length);
+  inst.castShadow=true; inst.receiveShadow=true; inst.frustumCulled=false;
+  const m4=new THREE.Matrix4(), q=new THREE.Quaternion(), sc=new THREE.Vector3(), pos=new THREE.Vector3();
+  segs.forEach((s,i)=>{
+    pos.set(s.cx,H/2,s.cz);
+    sc.set(s.horiz?s.len:TH, H, s.horiz?TH:s.len);
+    m4.compose(pos,q,sc); inst.setMatrixAt(i,m4);
+  });
+  inst.instanceMatrix.needsUpdate=true; level.add(inst);
+
+  const floor=new THREE.Mesh(new THREE.PlaneGeometry(N*CELL,N*CELL),M_FLOOR);
+  floor.rotation.x=-Math.PI/2; floor.receiveShadow=true; level.add(floor);
+  M_FLOOR.map=TEX_WALL.clone(); M_FLOOR.map.repeat.set(N*2,N*2);
+  M_FLOOR.map.wrapS=M_FLOOR.map.wrapT=THREE.RepeatWrapping; M_FLOOR.map.needsUpdate=true;
+
+  const ceil=new THREE.Mesh(new THREE.PlaneGeometry(N*CELL,N*CELL),M_CEIL);
+  ceil.rotation.x=Math.PI/2; ceil.position.y=H; level.add(ceil);
+
+  // ── 空格挑選（不重複）──
+  const free=[];
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++) free.push({x,y});
+  free.sort(()=>Math.random()-0.5);
+  const taken=new Set(); taken.add(idx(0,0));
+  const take=(minDistFromStart=4)=>{
+    for(let i=0;i<free.length;i++){
+      const c=free[i];
+      if(taken.has(idx(c.x,c.y))) continue;
+      if(Math.hypot(c.x,c.y)<minDistFromStart) continue;
+      taken.add(idx(c.x,c.y)); return c;
+    }
+    return {x:(Math.random()*N)|0,y:(Math.random()*N)|0};
+  };
+
+  // ── 保險絲 ──
+  for(let i=0;i<CONFIG.FUSES;i++){
+    const c=take(5), p=cellToWorld(c.x,c.y);
+    const g=new THREE.Group();
+    const body=new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.09,0.34,12),M_GLOW);
+    const cap1=new THREE.Mesh(new THREE.CylinderGeometry(0.11,0.11,0.06,12),M_METAL);
+    cap1.position.y=0.19; const cap2=cap1.clone(); cap2.position.y=-0.19;
+    g.add(body,cap1,cap2);
+    g.position.set(p.x,0.95,p.z);
+    const pl=new THREE.PointLight(PAL.accent,7,5,1.8); g.add(pl);
+    g.castShadow=true; level.add(g);
+    fuses.push({g,cell:c,taken:false,ph:Math.random()*7});
+  }
+  // ── 電池 ──
+  for(let i=0;i<CONFIG.BATTERIES;i++){
+    const c=take(3), p=cellToWorld(c.x,c.y);
+    const g=new THREE.Group();
+    const b=new THREE.Mesh(new THREE.CylinderGeometry(0.075,0.075,0.22,10),M_BLUE);
+    const t=new THREE.Mesh(new THREE.CylinderGeometry(0.035,0.035,0.04,8),M_METAL);
+    t.position.y=0.13; g.add(b,t);
+    g.position.set(p.x,0.55,p.z); level.add(g);
+    batteries.push({g,cell:c,taken:false,ph:Math.random()*7});
+  }
+  // ── 置物櫃（躲藏點）──
+  for(let i=0;i<CONFIG.LOCKERS;i++){
+    const c=take(3), p=cellToWorld(c.x,c.y);
+    const g=new THREE.Group();
+    const body=new THREE.Mesh(bevelBox(0.72,2.0,0.5),M_METAL);
+    body.position.y=1.0;
+    const vent=new THREE.Mesh(bevelBox(0.42,0.28,0.04),
+      new THREE.MeshStandardMaterial({color:0x22262e,roughness:0.7,metalness:0.5}));
+    vent.position.set(0,1.62,0.26);
+    const handle=new THREE.Mesh(new THREE.CylinderGeometry(0.02,0.02,0.16,6),M_METAL);
+    handle.rotation.z=Math.PI/2; handle.position.set(0.26,1.0,0.27);
+    g.add(body,vent,handle);
+    const ang=(Math.floor(Math.random()*4))*Math.PI/2;
+    g.position.set(p.x+Math.sin(ang)*(CELL/2-0.4),0,p.z+Math.cos(ang)*(CELL/2-0.4));
+    g.rotation.y=ang+Math.PI;
+    g.traverse(o=>{ if(o.isMesh){o.castShadow=true;o.receiveShadow=true;} });
+    level.add(g);
+    lockers.push({g,cell:c,pos:g.position.clone()});
+  }
+  // ── 吊燈（固定微光地標，gamedev-horror §2）──
+  for(let i=0;i<18;i++){
+    const c=take(2), p=cellToWorld(c.x,c.y);
+    const g=new THREE.Group();
+    const shade=new THREE.Mesh(new THREE.ConeGeometry(0.3,0.24,10,1,true),M_METAL);
+    shade.position.y=H-0.16;
+    const bulb=new THREE.Mesh(new THREE.SphereGeometry(0.075,8,6),
+      new THREE.MeshStandardMaterial({color:0xffe6b0,emissive:0xffcc70,emissiveIntensity:2.6}));
+    bulb.position.y=H-0.30;
+    const wire=new THREE.Mesh(new THREE.CylinderGeometry(0.008,0.008,0.16,4),M_METAL);
+    wire.position.y=H-0.06;
+    const pl=new THREE.PointLight(0xffcc80,16,11,1.7); pl.position.y=H-0.32;
+    g.add(shade,bulb,wire,pl);
+    g.position.set(p.x,0,p.z); level.add(g);
+    lamps.push({g,pl,bulb,ph:Math.random()*7,flick:Math.random()<0.35});
+  }
+  // ── 管線與電箱（佈景）──
+  for(let i=0;i<26;i++){
+    const c=take(1), p=cellToWorld(c.x,c.y);
+    if(Math.random()<0.55){
+      const pipe=new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.09,CELL,8),M_METAL);
+      pipe.rotation.z=Math.PI/2; pipe.rotation.y=Math.random()<0.5?0:Math.PI/2;
+      pipe.position.set(p.x,H-0.42,p.z);
+      pipe.castShadow=true; level.add(pipe);
+    } else {
+      const box=new THREE.Mesh(bevelBox(0.6,0.8,0.24),M_METAL);
+      const ang=(Math.floor(Math.random()*4))*Math.PI/2;
+      box.position.set(p.x+Math.sin(ang)*(CELL/2-0.2),1.4,p.z+Math.cos(ang)*(CELL/2-0.2));
+      box.rotation.y=ang;
+      const led=new THREE.Mesh(new THREE.SphereGeometry(0.035,6,5),
+        new THREE.MeshStandardMaterial({color:0x8e2020,emissive:0x8e2020,emissiveIntensity:2.2}));
+      led.position.set(0.18,0.28,0.14); box.add(led);
+      box.castShadow=true; level.add(box);
+    }
+  }
+  // ── 出口門 ──
+  const ec={x:N-1,y:N-1}, ep=cellToWorld(ec.x,ec.y);
+  const door=new THREE.Group();
+  const panel=new THREE.Mesh(bevelBox(2.2,2.6,0.18),
+    new THREE.MeshStandardMaterial({map:TEX_METAL,roughness:0.45,metalness:0.8,color:0x5a4a3a}));
+  panel.position.y=1.3;
+  const frame=new THREE.Mesh(bevelBox(2.5,2.9,0.1),M_METAL); frame.position.set(0,1.45,-0.08);
+  door.add(frame,panel);
+  const slots=[];
+  for(let i=0;i<CONFIG.FUSES;i++){
+    const s=new THREE.Mesh(new THREE.BoxGeometry(0.12,0.3,0.06),
+      new THREE.MeshStandardMaterial({color:0x1a1e26,emissive:0x000000,emissiveIntensity:0}));
+    s.position.set(-0.5+i*0.25,1.75,0.11); door.add(s); slots.push(s);
+  }
+  door.position.set(ep.x,0,ep.z+CELL/2-0.2);
+  door.traverse(o=>{ if(o.isMesh){o.castShadow=true;o.receiveShadow=true;} });
+  level.add(door);
+  G.exit={g:door,cell:ec,slots,open:false};
+
+  return { start:{x:0,y:0} };
+}
+
+/* ═══════════════════════════════════════════════════
+   §F STALKER（gamedev-horror §4 / gamedev-3d §3 側影建模）
+   ═══════════════════════════════════════════════════ */
+function buildStalker(){
+  const skin=new THREE.MeshStandardMaterial({color:0x6e6a62,roughness:0.86,metalness:0.03});
+  const dark=new THREE.MeshStandardMaterial({color:0x24252a,roughness:0.92,metalness:0.02});
+  const eyeM=new THREE.MeshStandardMaterial({color:0xffe9b0,emissive:0xffd070,emissiveIntensity:3.2,
+    roughness:0.2});
+  const root=new THREE.Group();
+  const rig={};
+  const lathe=(pts,seg=18)=>new THREE.LatheGeometry(pts.map(p=>new THREE.Vector2(p[0],p[1])),seg);
+  const taper=(r1,r2,len,v=12)=>{ const g=new THREE.CylinderGeometry(r2,r1,len,v,1);
+    g.translate(0,-len/2,0); return g; };
+
+  // 骨盆 0.78 → 0.98（絕對高度規劃，lathe 原點在剖面底部）
+  const hip=new THREE.Mesh(lathe([[0,0],[0.115,0.02],[0.132,0.08],[0.122,0.15],[0.09,0.20],[0,0.21]]),dark);
+  hip.position.y=0.78; hip.scale.set(1,1,0.72); root.add(hip); rig.hip=hip;
+  // 軀幹 0.92 → 1.36（刻意瘦長，製造不安）
+  const torso=new THREE.Mesh(lathe([[0,0],[0.135,0.02],[0.128,0.10],[0.118,0.17],
+    [0.152,0.30],[0.168,0.37],[0.125,0.42],[0.07,0.435],[0,0.44]]),skin);
+  torso.position.y=0.14; torso.scale.set(1,1,0.62); hip.add(torso); rig.torso=torso;
+  // 頸 + 頭（頭刻意偏小，拉長身形）
+  const neck=new THREE.Mesh(lathe([[0,0],[0.05,0.01],[0.045,0.10],[0.036,0.13],[0,0.135]],14),skin);
+  neck.position.set(0,0.40,-0.01); torso.add(neck); rig.neck=neck;
+  const head=new THREE.Mesh(lathe([[0,0],[0.052,0.006],[0.076,0.04],[0.084,0.095],
+    [0.076,0.15],[0.052,0.185],[0,0.20]]),skin);
+  head.position.y=0.08; head.scale.set(0.9,1,1.14); neck.add(head); rig.head=head;
+  const jaw=new THREE.Mesh(lathe([[0,0],[0.036,0.005],[0.058,0.024],[0.044,0.046],[0,0.052]],12),dark);
+  jaw.position.set(0,0.035,-0.03); torso.add(jaw); head.add(jaw); rig.jaw=jaw;
+  for(const sx of [1,-1]){
+    const e=new THREE.Mesh(new THREE.SphereGeometry(0.017,8,6),eyeM);
+    e.position.set(0.032*sx,0.105,-0.062); head.add(e); rig['eye'+(sx>0?'L':'R')]=e;
+  }
+  // 手臂：刻意過長（臂長 0.58 vs 身高 1.56）
+  for(const [s,sx] of [['L',1],['R',-1]]){
+    const sh=new THREE.Mesh(new THREE.SphereGeometry(0.055,12,8),skin);
+    sh.position.set(0.175*sx,0.35,0); torso.add(sh); rig['shoulder'+s]=sh;
+    const ua=new THREE.Mesh(taper(0.048,0.036,0.30),skin);
+    ua.rotation.set(THREE.MathUtils.degToRad(-8-4*sx),0,THREE.MathUtils.degToRad(9*sx));
+    sh.add(ua); rig['upperArm'+s]=ua;
+    const el=new THREE.Mesh(new THREE.SphereGeometry(0.04,10,8),skin);
+    el.position.y=-0.30; ua.add(el); rig['elbow'+s]=el;
+    const fa=new THREE.Mesh(taper(0.036,0.026,0.28),skin);
+    fa.rotation.x=THREE.MathUtils.degToRad(-14-5*sx); el.add(fa); rig['forearm'+s]=fa;
+    const hd=new THREE.Mesh(lathe([[0,0],[0.028,0.006],[0.034,0.035],[0.02,0.07],[0,0.08]],10),dark);
+    hd.position.y=-0.28; hd.rotation.x=Math.PI; hd.scale.set(1,1,0.6); fa.add(hd); rig['hand'+s]=hd;
+  }
+  // 腿
+  for(const [s,sx] of [['L',1],['R',-1]]){
+    const th=new THREE.Mesh(taper(0.066,0.05,0.42),dark);
+    th.position.set(0.078*sx,0.03,0);
+    th.rotation.set(THREE.MathUtils.degToRad(3-2*sx),0,THREE.MathUtils.degToRad(2*sx));
+    hip.add(th); rig['thigh'+s]=th;
+    const kn=new THREE.Mesh(new THREE.SphereGeometry(0.05,10,8),dark);
+    kn.position.y=-0.42; th.add(kn); rig['knee'+s]=kn;
+    const sn=new THREE.Mesh(taper(0.048,0.034,0.40),dark);
+    sn.rotation.x=THREE.MathUtils.degToRad(-4-2*sx); kn.add(sn); rig['shin'+s]=sn;
+    const ft=new THREE.Mesh(bevelBox(0.09,0.055,0.2),dark);
+    ft.position.set(0,-0.415,-0.05); sn.add(ft); rig['foot'+s]=ft;
+  }
+  // 細節件 ≥5
+  const rib1=new THREE.Mesh(bevelBox(0.13,0.02,0.02),new THREE.MeshStandardMaterial({color:0xb9b0a0,roughness:0.5}));
+  rib1.position.set(0.01,0.26,-0.1); rib1.rotation.z=THREE.MathUtils.degToRad(-6); torso.add(rib1);
+  const rib2=rib1.clone(); rib2.position.set(0.02,0.21,-0.1); torso.add(rib2);
+  const spine=new THREE.Mesh(bevelBox(0.03,0.24,0.03),new THREE.MeshStandardMaterial({color:0xb9b0a0,roughness:0.5}));
+  spine.position.set(0,0.26,0.10); torso.add(spine);
+  const collar=new THREE.Mesh(new THREE.TorusGeometry(0.062,0.012,6,14),M_METAL);
+  collar.rotation.x=Math.PI/2; collar.position.y=0.03; neck.add(collar);
+  const shard=new THREE.Mesh(bevelBox(0.05,0.14,0.02),dark);
+  shard.position.set(-0.13,0.30,0.06); shard.rotation.z=THREE.MathUtils.degToRad(18); torso.add(shard);
+
+  root.traverse(o=>{ if(o.isMesh){ o.castShadow=true; o.receiveShadow=true; } });
+  addOutline(root,1.04);
+  root.visible=false; scene.add(root);
+  const base={}; for(const k in rig) base[k]=rig[k].rotation.clone();
+  return { root, rig, base, mat:{skin,dark,eyeM} };
+}
+
+/* ═══════════════════════════════════════════════════
+   §G 遊戲狀態
+   ═══════════════════════════════════════════════════ */
+const G={ state:'load', t:0, elapsed:0, fuses:0, batteryUsed:0,
+  hiding:false, hideLocker:null, caughtCount:0, exit:null,
+  lastPeak:-999, danger:0, awake:false, escapes:0, scares:0 };
+const P={ vel:new THREE.Vector3(), horiz:new THREE.Vector3(),
+  stamina:CONFIG.PLAYER.stamina, torch:100, torchOn:true, torchDead:false,
+  crouch:false, run:false, camY:CONFIG.PLAYER.eye, bob:0, step:0, breathT:0,
+  yaw:0, pitch:0, locked:false, sens:(Number(Store.get('ts_sens'))||22)/10000,
+  invert:Store.get('ts_invert')==='1', flicker:Store.get('ts_flicker')!=='0' };
+const S={ obj:null, pos:new THREE.Vector3(), cell:{x:0,y:0}, target:{x:0,y:0},
+  state:'idle', lastSeen:null, memT:0, phase:0, roarT:0, active:false, speedMul:1, hunt:0 };
+const FX={ shake:0, hitStopUntil:0 };
+const PITCH_MAX=Math.PI/2*0.94;
+
+let stalker=null;
+
+/* ═══════════════════════════════════════════════════
+   §H 輸入（桌機指標鎖定 + 觸控，共用同一組 yaw/pitch）
+   ═══════════════════════════════════════════════════ */
+function applyLook(dx,dy){
+  P.yaw-=dx*P.sens;
+  P.pitch-=dy*P.sens*(P.invert?-1:1);
+  P.pitch=clamp(P.pitch,-PITCH_MAX,PITCH_MAX);
+}
+const keys={};
+addEventListener('keydown',e=>{
+  keys[e.code]=true;
+  if(e.code==='KeyF') toggleTorch();
+  if(e.code==='KeyE') interact();
+  if(e.code==='Escape'&&G.state==='play') pause();
+  if(['Space','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup',e=>keys[e.code]=false);
+document.addEventListener('pointerlockchange',()=>{
+  const was=P.locked;
+  P.locked=document.pointerLockElement===renderer.domElement;
+  if(was&&!P.locked&&G.state==='play') pause();
+});
+document.addEventListener('mousemove',e=>{
+  if(!P.locked||G.state!=='play') return;
+  applyLook(e.movementX||0,e.movementY||0);
+});
+addEventListener('mousedown',()=>{
+  if(!DEV.touch&&G.state==='play'&&!P.locked) renderer.domElement.requestPointerLock?.();
+});
+
+const TOUCH={ move:{x:0,y:0}, run:false };
+(function initTouch(){
+  if(!DEV.touch) return;
+  const stick=document.getElementById('stick'), knob=document.getElementById('knob');
+  const zM=document.getElementById('tzMove'), zL=document.getElementById('tzLook');
+  const ptr=new Map(); const DEAD=0.12, SAT=60;
+  const clearMove=()=>{ TOUCH.move.x=0; TOUCH.move.y=0;
+    stick.classList.remove('on'); knob.style.transform='translate(-50%,-50%)'; };
+  zM.addEventListener('pointerdown',e=>{
+    e.preventDefault(); try{ zM.setPointerCapture(e.pointerId); }catch(_){}
+    ptr.set(e.pointerId,{k:'m',ox:e.clientX,oy:e.clientY});
+    stick.style.left=e.clientX+'px'; stick.style.top=e.clientY+'px'; stick.classList.add('on');
+  });
+  zM.addEventListener('pointermove',e=>{
+    const t=ptr.get(e.pointerId); if(!t||t.k!=='m') return;
+    const dx=e.clientX-t.ox, dy=e.clientY-t.oy, len=Math.hypot(dx,dy);
+    const n=Math.min(len/SAT,1);
+    if(len<0.001||n<DEAD){ TOUCH.move.x=0; TOUCH.move.y=0; }
+    else { TOUCH.move.x=dx/len*n; TOUCH.move.y=dy/len*n; }
+    const k=Math.min(len,SAT);
+    knob.style.transform=`translate(calc(-50% + ${len?dx/len*k:0}px), calc(-50% + ${len?dy/len*k:0}px))`;
+  });
+  zL.addEventListener('pointerdown',e=>{
+    e.preventDefault(); try{ zL.setPointerCapture(e.pointerId); }catch(_){}
+    ptr.set(e.pointerId,{k:'l',lx:e.clientX,ly:e.clientY});
+  });
+  zL.addEventListener('pointermove',e=>{
+    const t=ptr.get(e.pointerId); if(!t||t.k!=='l') return;
+    if(G.state==='play') applyLook(e.clientX-t.lx,e.clientY-t.ly);
+    t.lx=e.clientX; t.ly=e.clientY;
+  });
+  const rel=e=>{ const t=ptr.get(e.pointerId); if(!t) return;
+    ptr.delete(e.pointerId); if(t.k==='m') clearMove(); };
+  [zM,zL].forEach(z=>{ z.addEventListener('pointerup',rel);
+    z.addEventListener('pointercancel',rel); z.addEventListener('lostpointercapture',rel); });
+  function purge(){ ptr.clear(); clearMove(); TOUCH.run=false;
+    document.querySelectorAll('.tbtn').forEach(b=>b.classList.remove('press')); }
+  addEventListener('blur',purge);
+  document.addEventListener('visibilitychange',()=>{ if(document.hidden) purge(); });
+  function bind(id,{down,up,toggle}={}){
+    const el=document.getElementById(id);
+    el.addEventListener('pointerdown',e=>{
+      e.preventDefault(); e.stopPropagation();
+      try{ el.setPointerCapture(e.pointerId); }catch(_){}   // 失敗也要繼續
+      el.classList.add('press'); down&&down();
+    });
+    const u=()=>{ el.classList.remove('press'); up&&up(); };
+    el.addEventListener('pointerup',u); el.addEventListener('pointercancel',u);
+    el.addEventListener('lostpointercapture',u);
+  }
+  bind('bLight',{down:()=>toggleTorch()});
+  bind('bRun',{down:()=>TOUCH.run=true, up:()=>TOUCH.run=false});
+  bind('bCrouch',{down:()=>{ P.crouch=!P.crouch;
+    document.getElementById('bCrouch').classList.toggle('active',P.crouch); Haptics.fire('uiTap'); }});
+  bind('bUse',{down:()=>interact()});
+  bind('bPause',{down:()=>{ Haptics.fire('uiTap'); G.state==='play'?pause():resume(); }});
+})();
+(function orientation(){
+  const rot=document.getElementById('rot');
+  function check(){
+    const need=DEV.touch&&matchMedia('(orientation: portrait)').matches&&Math.min(innerWidth,innerHeight)<820;
+    rot.classList.toggle('on',need);
+    if(need&&G.state==='play') pause();
+  }
+  matchMedia('(orientation: portrait)').addEventListener('change',check);
+  addEventListener('resize',check); window.__chkOri=check;
+})();
+
+/* ═══════════════════════════════════════════════════
+   §I 動作
+   ═══════════════════════════════════════════════════ */
+const $=s=>document.querySelector(s);
+function toggleTorch(){
+  if(G.state!=='play') return;
+  if(P.torchDead&&!P.torchOn){ Snd.play('batteryEmpty'); Haptics.fire('fail'); return; }
+  P.torchOn=!P.torchOn;
+  Snd.play('lightToggle'); Snd.humOn(P.torchOn); Haptics.fire('toggle');
+  const b=document.getElementById('bLight'); b&&b.classList.toggle('active',P.torchOn);
+}
+function nearest(list,maxD){
+  let best=null,bd=maxD;
+  for(const it of list){
+    if(it.taken) continue;
+    const d=it.g.position.distanceTo(player.position);
+    if(d<bd){ bd=d; best=it; }
+  }
+  return best;
+}
+function nearestLocker(maxD){
+  let best=null,bd=maxD;
+  for(const l of lockers){
+    const d=l.pos.distanceTo(player.position);
+    if(d<bd){ bd=d; best=l; }
+  }
+  return best;
+}
+function interact(){
+  if(G.state!=='play') return;
+  if(G.hiding){ exitLocker(); return; }
+  const f=nearest(fuses,1.9);
+  if(f){ f.taken=true; f.g.visible=false; G.fuses++;
+    Snd.play('fuseGet'); Haptics.fire('pickup'); updateFuses();
+    showMsg(`FUSE ${G.fuses} / ${CONFIG.FUSES}`,1.4);
+    if(G.fuses>=CONFIG.STALKER.wakeAtFuses) wakeStalker();
+    if(G.fuses>=CONFIG.FUSES) openExit();
+    return; }
+  const b=nearest(batteries,1.7);
+  if(b){ b.taken=true; b.g.visible=false;
+    P.torch=Math.min(100,P.torch+38); P.torchDead=false;
+    Snd.play('batteryGet'); Haptics.fire('pickup'); showMsg('+ BATTERY',1.0); return; }
+  const lk=nearestLocker(1.7);
+  if(lk){ enterLocker(lk); return; }
+  const ep=G.exit.g.position;
+  if(ep.distanceTo(player.position)<2.6){
+    if(G.exit.open){ win(); }
+    else { Snd.play('doorLocked'); Haptics.fire('fail');
+      showMsg(`還缺 ${CONFIG.FUSES-G.fuses} 個保險絲`,1.6); }
+  }
+}
+function enterLocker(lk){
+  G.hiding=true; G.hideLocker=lk;
+  player.position.set(lk.pos.x,0,lk.pos.z);
+  Snd.play('lockerEnter'); Snd.play('lockerShut',0.18); Haptics.fire('hide');
+  showHint('E / 互動 離開');
+}
+function exitLocker(){
+  G.hiding=false;
+  const lk=G.hideLocker; G.hideLocker=null;
+  if(lk){ const back=new THREE.Vector3(Math.sin(lk.g.rotation.y),0,Math.cos(lk.g.rotation.y));
+    player.position.addScaledVector(back,-0.9); }
+  Snd.play('lockerShut'); Haptics.fire('hide'); showHint('');
+}
+function openExit(){
+  G.exit.open=true;
+  G.exit.slots.forEach(s=>{ s.material.emissive=new THREE.Color(PAL.accent); s.material.emissiveIntensity=2.4; });
+  Snd.play('doorUnlock'); Haptics.fire('unlock');
+  showMsg('出口已解鎖\n回到入口的另一端',3.0);
+}
+
+/* ═══════════════════════════════════════════════════
+   §J STALKER AI（gamedev-horror §4）
+   ═══════════════════════════════════════════════════ */
+function wakeStalker(){
+  if(S.active) return;
+  S.active=true; G.awake=true;
+  const far=[]; for(let y=0;y<N;y++) for(let x=0;x<N;x++) far.push({x,y});
+  const pc=worldToCell(player.position);
+  far.sort((a,b)=>(Math.hypot(b.x-pc.x,b.y-pc.y))-(Math.hypot(a.x-pc.x,a.y-pc.y)));
+  const c=far[0];
+  S.cell={...c}; S.pos.copy(cellToWorld(c.x,c.y)); stalker.root.position.copy(S.pos);
+  stalker.root.visible=true;
+  S.state='patrol'; S.target={...c};
+  Snd.bedTo(0.0001,1.2);                  // 突然的安靜 = 預告
+  setTimeout(()=>{ if(G.state==='play'){ Snd.play('stalkerRoar'); Haptics.fire('scare');
+    Snd.bedTo(0.05,2.5); showMsg('有東西醒了',2.4); G.scares++; G.lastPeak=G.elapsed; } },1600);
+}
+function playerNoiseRadius(){
+  if(G.hiding) return 0;
+  const spd=Math.hypot(P.horiz.x,P.horiz.z);
+  if(spd<0.2) return 0;
+  if(P.crouch) return CONFIG.STALKER.hearCrouch;
+  return P.run?CONFIG.STALKER.hearRun:CONFIG.STALKER.hearWalk;
+}
+function stalkerCanSee(){
+  if(G.hiding) return false;
+  const to=player.position.clone().sub(S.pos); to.y=0;
+  const d=to.length();
+  if(d>CONFIG.STALKER.visDist) return false;
+  to.normalize();
+  const fwd=new THREE.Vector3(Math.sin(stalker.root.rotation.y),0,Math.cos(stalker.root.rotation.y));
+  if(Math.acos(clamp(fwd.dot(to),-1,1))>THREE.MathUtils.degToRad(CONFIG.STALKER.visAngle/2)) return false;
+  // 視線遮蔽：逐格檢查是否連通
+  const a=worldToCell(S.pos), b=worldToCell(player.position);
+  const steps=Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y));
+  for(let i=1;i<=steps;i++){
+    const cx=Math.round(lerp(a.x,b.x,i/steps)), cy=Math.round(lerp(a.y,b.y,i/steps));
+    const px=Math.round(lerp(a.x,b.x,(i-1)/steps)), py=Math.round(lerp(a.y,b.y,(i-1)/steps));
+    if(px===cx&&py===cy) continue;
+    if(px===cx){ if(!open(px,Math.min(py,cy),py<cy?'s':'n')) return false; }
+    else if(py===cy){ if(!open(Math.min(px,cx),py,px<cx?'e':'w')) return false; }
+    else return false;
+  }
+  return true;
+}
+let pathT=0;
+function updateStalker(dt){
+  if(!S.active||G.state!=='play') return;
+  const pc=worldToCell(player.position);
+  const heard=playerNoiseRadius()>0 && S.pos.distanceTo(player.position)<playerNoiseRadius();
+  const seen=stalkerCanSee();
+
+  if(seen||heard){
+    S.state='chase'; S.lastSeen={...pc}; S.memT=CONFIG.STALKER.memory;
+    if(S.roarT<=0){ Snd.play('stalkerRoar'); S.roarT=rand(4,8);
+      if(seen) Haptics.fire('near'); }
+  } else if(S.state==='chase'){
+    S.memT-=dt;
+    if(S.memT<=0){ S.state='search'; S.memT=6; Snd.play('stalkerLose'); G.escapes++; }
+  } else if(S.state==='search'){
+    S.memT-=dt;
+    if(S.memT<=0){ S.state='patrol'; S.lastSeen=null; }
+  }
+  S.roarT-=dt;
+  if(S.state==='chase'||S.state==='search') S.hunt=0; else S.hunt=Math.min(8,S.hunt+dt*0.12);
+
+  pathT-=dt;
+  if(pathT<=0){
+    pathT=0.35;
+    let goal=null;
+    if(S.state==='chase') goal=S.lastSeen||pc;
+    else if(S.state==='search'&&S.lastSeen){
+      goal={ x:clamp(S.lastSeen.x+((Math.random()*5|0)-2),0,N-1),
+             y:clamp(S.lastSeen.y+((Math.random()*5|0)-2),0,N-1) };
+    } else {
+      // 巡邏：朝玩家「所在區域」而非完全隨機，否則在迷宮中幾乎不會相遇。
+      // 半徑隨未接觸時間縮小（張力遞增），但永遠不直接指向玩家格。
+      const r=Math.max(2,Math.round(6-S.hunt*0.6));
+      goal={ x:clamp(pc.x+((Math.random()*(2*r+1))|0)-r,0,N-1),
+             y:clamp(pc.y+((Math.random()*(2*r+1))|0)-r,0,N-1) };
+      if(Math.random()<0.2) goal={ x:(Math.random()*N)|0, y:(Math.random()*N)|0 };
+    }
+    const nx=bfsNext(S.cell,goal);
+    if(nx) S.target=nx;
+  }
+  const tp=cellToWorld(S.target.x,S.target.y);
+  const dir=tp.clone().sub(S.pos); dir.y=0;
+  const dist=dir.length();
+  const spd=CONFIG.STALKER.speed*(S.state==='chase'?1:0.55)*S.speedMul;
+  if(dist>0.06){
+    dir.normalize();
+    S.pos.addScaledVector(dir,Math.min(spd*dt,dist));
+    const ty=Math.atan2(dir.x,dir.z);
+    let dy=ty-stalker.root.rotation.y;
+    while(dy>Math.PI) dy-=Math.PI*2; while(dy<-Math.PI) dy+=Math.PI*2;
+    stalker.root.rotation.y+=dy*clamp(dt*6,0,1);
+  } else S.cell={...S.target};
+  stalker.root.position.copy(S.pos);
+
+  // 抓到
+  if(!G.hiding && S.pos.distanceTo(player.position)<CONFIG.STALKER.catchDist) caught();
+  // 躲藏中靠太近：呼吸暴露風險
+  if(G.hiding && S.pos.distanceTo(player.position)<3.2){
+    G.danger=1;
+    if(Math.random()<dt*0.5) Snd.play('breath');
+  }
+  animStalker(dt,spd);
+}
+function animStalker(dt,spd){
+  const r=stalker.rig,b=stalker.base;
+  S.phase+=dt*(spd*1.6+0.5);
+  const w=S.phase, sw=Math.sin(w), cw=Math.cos(w);
+  const amp=clamp(spd/3.5,0.3,1.3);
+  if(r.torso){
+    r.torso.scale.y=1+Math.sin(S.phase*0.9)*0.02;
+    r.torso.rotation.y=b.torso.y+sw*0.10*amp;
+    r.torso.rotation.x=b.torso.x+0.14;
+  }
+  if(r.hip){ r.hip.position.x=Math.sin(S.phase*0.6)*0.012; r.hip.rotation.y=b.hip.y-sw*0.09*amp; }
+  if(r.thighL) r.thighL.rotation.x=b.thighL.x+sw*0.66*amp;
+  if(r.thighR) r.thighR.rotation.x=b.thighR.x-sw*0.66*amp;
+  if(r.shinL)  r.shinL.rotation.x =b.shinL.x -Math.max(0,cw)*0.5*amp;
+  if(r.shinR)  r.shinR.rotation.x =b.shinR.x -Math.max(0,-cw)*0.5*amp;
+  if(r.upperArmL) r.upperArmL.rotation.x=b.upperArmL.x-sw*0.30*amp;
+  if(r.upperArmR) r.upperArmR.rotation.x=b.upperArmR.x+sw*0.30*amp;
+  if(r.forearmL)  r.forearmL.rotation.x =b.forearmL.x +Math.sin(w*1.5)*0.16*amp;
+  if(r.forearmR)  r.forearmR.rotation.x =b.forearmR.x -Math.sin(w*1.5+1)*0.16*amp;
+  if(r.head){
+    const rel=Math.atan2(player.position.x-S.pos.x,player.position.z-S.pos.z)-stalker.root.rotation.y;
+    let a=rel; while(a>Math.PI)a-=6.283; while(a<-Math.PI)a+=6.283;
+    r.head.rotation.y=lerp(r.head.rotation.y,b.head.y+clamp(a,-1.0,1.0),0.07);
+  }
+  if(r.jaw) r.jaw.rotation.x=lerp(r.jaw.rotation.x,b.jaw.x+(S.state==='chase'?0.34:0.10),0.1);
+  const pulse=1+Math.sin(S.phase*2.2)*0.2;
+  stalker.mat.eyeM.emissiveIntensity=3.2*pulse*(S.state==='chase'?1.5:1);
+}
+
+/* ═══════════════════════════════════════════════════
+   §K 玩家更新
+   ═══════════════════════════════════════════════════ */
+const fwd=new THREE.Vector3(), right=new THREE.Vector3(), up=new THREE.Vector3(0,1,0);
+const tmpV=new THREE.Vector3();
+function collideWalls(pos,r=0.34){
+  for(const w of walls){
+    const cx=clamp(pos.x,w.x1-r,w.x2+r), cz=clamp(pos.z,w.z1-r,w.z2+r);
+    if(pos.x>w.x1-r&&pos.x<w.x2+r&&pos.z>w.z1-r&&pos.z<w.z2+r){
+      const dl=Math.abs(pos.x-(w.x1-r)), dr=Math.abs(pos.x-(w.x2+r));
+      const dt2=Math.abs(pos.z-(w.z1-r)), db=Math.abs(pos.z-(w.z2+r));
+      const m=Math.min(dl,dr,dt2,db);
+      if(m===dl) pos.x=w.x1-r; else if(m===dr) pos.x=w.x2+r;
+      else if(m===dt2) pos.z=w.z1-r; else pos.z=w.z2+r;
+    }
+  }
+}
+function updatePlayer(dt){
+  const C=CONFIG.PLAYER;
+  camera.getWorldDirection(fwd); fwd.y=0; fwd.normalize();
+  right.crossVectors(fwd,up).normalize();
+  let ix=0,iz=0,analog=0;
+  if(!G.hiding){
+    if(keys.KeyW||keys.ArrowUp) iz+=1; if(keys.KeyS||keys.ArrowDown) iz-=1;
+    if(keys.KeyD||keys.ArrowRight) ix+=1; if(keys.KeyA||keys.ArrowLeft) ix-=1;
+    if(DEV.touch){ ix+=TOUCH.move.x; iz+=-TOUCH.move.y;
+      analog=Math.hypot(TOUCH.move.x,TOUCH.move.y); }
+  }
+  P.crouch = DEV.touch ? P.crouch : (keys.ControlLeft||keys.ControlRight||keys.KeyC);
+  const wantRun=(keys.ShiftLeft||keys.ShiftRight||TOUCH.run)&&!P.crouch&&P.stamina>1&&(iz!==0||ix!==0);
+  P.run=wantRun;
+  const maxSpd=P.crouch?C.crouch:(P.run?C.run:C.walk);
+
+  const want=tmpV.set(0,0,0).addScaledVector(fwd,iz).addScaledVector(right,ix);
+  if(want.lengthSq()>0){
+    const mag=analog>0?Math.min(analog,1):1;
+    want.normalize().multiplyScalar(maxSpd*mag);
+  }
+  const moving=want.lengthSq()>0.01;
+  const k=clamp(dt/(moving?C.accel:C.decel),0,1);
+  P.horiz.x=lerp(P.horiz.x,want.x,k); P.horiz.z=lerp(P.horiz.z,want.z,k);
+
+  if(!G.hiding){
+    player.position.x+=P.horiz.x*dt; player.position.z+=P.horiz.z*dt;
+    collideWalls(player.position);
+    const lim=N*CELL/2-0.5;
+    player.position.x=clamp(player.position.x,-lim,lim);
+    player.position.z=clamp(player.position.z,-lim,lim);
+  }
+
+  // 體力
+  if(P.run){ P.stamina=Math.max(0,P.stamina-C.staminaDrain*dt); if(P.stamina<=0) P.run=false; }
+  else P.stamina=Math.min(C.stamina,P.stamina+C.staminaRegen*dt);
+
+  // 腳步
+  const spd=Math.hypot(P.horiz.x,P.horiz.z);
+  if(spd>0.3&&!G.hiding){
+    P.step+=dt*spd*(P.crouch?1.0:1.5);
+    P.bob+=dt*spd*1.5;
+    if(P.step>Math.PI){ P.step-=Math.PI;
+      Snd.play(P.crouch?'footCrouch':(P.run?'footRun':'footWalk')); }
+  } else P.bob+=dt*0.7;
+  P.breathT-=dt;
+  if(P.breathT<=0&&(P.run||G.danger>0.4)){ Snd.play('breath'); P.breathT=P.run?1.1:2.2; }
+
+  // 手電筒電量
+  if(P.torchOn&&!P.torchDead){
+    P.torch=Math.max(0,P.torch-CONFIG.LIGHT.drain*dt);
+    if(P.torch<=0){ P.torchDead=true; P.torchOn=false; Snd.play('lightDead'); Snd.humOn(false);
+      showMsg('手電筒沒電了',2.0); }
+  } else if(!P.torchOn){ P.torch=Math.min(100,P.torch+CONFIG.LIGHT.regen*dt); }
+
+  // 前方距離自適應：貼牆時降光，否則近距離必定過曝成純白
+  let prox=1;
+  {
+    const o=camera.getWorldPosition(new THREE.Vector3());
+    const d=camera.getWorldDirection(new THREE.Vector3()); d.y=0; d.normalize();
+    const probe=new THREE.Vector3();
+    for(const t of [0.6,1.1,1.7,2.4,3.2]){
+      probe.copy(o).addScaledVector(d,t);
+      let blocked=false;
+      for(const w of walls){
+        if(probe.x>w.x1-0.1&&probe.x<w.x2+0.1&&probe.z>w.z1-0.1&&probe.z<w.z2+0.1){ blocked=true; break; }
+      }
+      if(blocked){ prox=clamp(t/3.2,0.30,1); break; }
+    }
+  }
+  P.prox=lerp(P.prox??1,prox,clamp(dt*7,0,1));
+
+  // 手電筒強度：低電量閃爍（gamedev-horror §2）
+  let want2=(P.torchOn?CONFIG.LIGHT.intensity:0)*P.prox;
+  if(P.torchOn&&P.torch<CONFIG.LIGHT.lowAt){
+    const f=P.flicker?(Math.random()<0.06?rand(0.1,0.4):1):1;
+    want2*=f;
+  }
+  torch.intensity=lerp(torch.intensity,want2,clamp(dt*14,0,1));
+
+  // 相機（位移在 player、眼高與晃動在 camera local）
+  FX.shake*=Math.pow(CONFIG.FEEL.shakeDecay,dt*60);
+  if(FX.shake<0.002) FX.shake=0;
+  const sh=FX.shake;
+  const targetEye=(P.crouch?C.eyeCrouch:C.eye)+(G.hiding?-0.1:0);
+  const bob=Math.sin(P.bob*2)*CONFIG.CAM.bob*clamp(spd/C.walk,0,1.4);
+  P.camY=lerp(P.camY,targetEye+bob,clamp(dt*9,0,1));
+  camera.position.set(Math.cos(P.bob)*CONFIG.CAM.bob*0.4+rand(-sh,sh)*0.15,
+                      P.camY+rand(-sh,sh)*0.15, 0);
+  const targetFov=P.run?CONFIG.CAM.fovRun:CONFIG.CAM.fov;
+  if(Math.abs(camera.fov-targetFov)>0.05){
+    camera.fov=lerp(camera.fov,targetFov,clamp(dt/0.2,0,1)); camera.updateProjectionMatrix();
+  }
+  camera.rotation.set(P.pitch,P.yaw,rand(-sh,sh)*0.04,'YXZ');
+
+  // 手電筒延遲跟隨（§2）
+  torch.target.position.x=lerp(torch.target.position.x,0.05+Math.sin(P.bob)*0.025,CONFIG.LIGHT.lerp);
+  torch.target.position.y=lerp(torch.target.position.y,-0.05+Math.sin(P.bob*2)*0.018,CONFIG.LIGHT.lerp);
+
+  // 互動提示
+  const canFuse=nearest(fuses,1.9), canBat=nearest(batteries,1.7), canLk=nearestLocker(1.7);
+  const nearExit=G.exit.g.position.distanceTo(player.position)<2.6;
+  let hint='';
+  if(G.hiding) hint='E / 互動 離開';
+  else if(canFuse) hint='E / 互動 拾取保險絲';
+  else if(canBat) hint='E / 互動 拾取電池';
+  else if(canLk) hint='E / 互動 躲進置物櫃';
+  else if(nearExit) hint=G.exit.open?'E / 互動 離開這裡':`還缺 ${CONFIG.FUSES-G.fuses} 個保險絲`;
+  showHint(hint);
+  const bu=document.getElementById('bUse'); bu&&bu.classList.toggle('show',!!hint);
+}
+
+/* ═══════════════════════════════════════════════════
+   §L HUD / 流程
+   ═══════════════════════════════════════════════════ */
+const DASH=75.4;
+function updateGauges(){
+  $('#gLight').style.strokeDashoffset=String(DASH*(1-P.torch/100));
+  $('#gStam').style.strokeDashoffset=String(DASH*(1-P.stamina/100));
+  $('#gLight').style.stroke=P.torch<CONFIG.LIGHT.lowAt?'#8e2020':'#e8c05a';
+}
+function updateFuses(){
+  const box=$('#fuseBox');
+  box.querySelectorAll('.fz').forEach(e=>e.remove());
+  for(let i=0;i<CONFIG.FUSES;i++){
+    const d=document.createElement('div');
+    d.className='fz'+(i<G.fuses?' on':''); box.appendChild(d);
+  }
+}
+let hintCur='';
+function showHint(t){ if(t===hintCur) return; hintCur=t;
+  const e=$('#hint'); e.textContent=t; e.style.opacity=t?'0.75':'0'; }
+let msgT=0;
+function showMsg(t,sec){ const e=$('#msg'); e.textContent=t; msgT=sec; e.style.opacity='1'; }
+function flashScreen(a=0.5){ const e=$('#flash'); e.style.opacity=String(a);
+  setTimeout(()=>e.style.opacity='0',70); }
+
+const scr={load:$('#loadScreen'),start:$('#startScreen'),pause:$('#pauseScreen'),over:$('#overScreen')};
+function setTouchActive(v){ if(DEV.touch) document.getElementById('touch').classList.toggle('on',v); }
+function show(k){ for(const s in scr) scr[s].classList.toggle('hidden',s!==k); setTouchActive(false); }
+function hideAll(){ for(const s in scr) scr[s].classList.add('hidden'); setTouchActive(true); }
+
+function caught(){
+  if(G.state!=='play') return;
+  G.state='over';
+  FX.shake=0.5; flashScreen(0.75);
+  Snd.play('caught'); Snd.play('gameOver',0.6); Haptics.fire('caught');
+  $('#hurt').style.opacity='1';
+  document.exitPointerLock?.();
+  $('#overTitle').textContent='CAUGHT';
+  $('#overSub').textContent='它找到你了';
+  $('#overStats').innerHTML=
+    `保險絲 ${G.fuses} / ${CONFIG.FUSES}<br>存活 ${Math.floor(G.elapsed)} 秒<br>脫離次數 ${G.escapes}`;
+  setTimeout(()=>show('over'),700);
+}
+function win(){
+  if(G.state!=='play') return;
+  G.state='over';
+  Snd.play('victory'); Haptics.fire('victory');
+  document.exitPointerLock?.();
+  const best=Number(Store.get('ts_best')||0);
+  const time=Math.floor(G.elapsed);
+  if(!best||time<best) Store.set('ts_best',time);
+  $('#overTitle').textContent='ESCAPED';
+  $('#overSub').textContent='你活著出來了';
+  $('#overStats').innerHTML=
+    `用時 ${time} 秒<br>脫離次數 ${G.escapes}<br>最佳紀錄 ${(!best||time<best)?time:best} 秒`;
+  show('over');
+}
+function pause(){ if(G.state!=='play') return; G.state='pause';
+  document.exitPointerLock?.(); show('pause'); Snd.play('uiClick'); }
+function resume(){ if(G.state!=='pause') return; hideAll(); G.state='play';
+  if(!DEV.touch) renderer.domElement.requestPointerLock?.(); Snd.play('uiClick'); }
+
+function resetGame(){
+  genMaze(); const info=buildLevel();
+  const sp=cellToWorld(info.start.x,info.start.y);
+  player.position.set(sp.x,0,sp.z);
+  // 面向一個開放方向，否則會正對邊界牆、整個畫面被牆填滿
+  const sc=cells[idx(info.start.x,info.start.y)];
+  P.yaw = !sc.s ? Math.PI : (!sc.e ? -Math.PI/2 : (!sc.n ? 0 : Math.PI/2));
+  P.pitch=0; P.horiz.set(0,0,0);
+  P.stamina=100; P.torch=100; P.torchOn=true; P.torchDead=false; P.crouch=false; P.run=false;
+  P.camY=CONFIG.PLAYER.eye; P.bob=0; P.step=0;
+  camera.rotation.set(0,0,0,'YXZ'); camera.fov=CONFIG.CAM.fov; camera.updateProjectionMatrix();
+  torch.intensity=0;
+  G.elapsed=0; G.fuses=0; G.hiding=false; G.hideLocker=null;
+  G.awake=false; G.escapes=0; G.scares=0; G.lastPeak=-999; G.danger=0;
+  S.active=false; S.state='idle'; S.lastSeen=null; S.memT=0; S.roarT=0; S.hunt=0;
+  if(stalker) stalker.root.visible=false;
+  FX.shake=0; $('#hurt').style.opacity='0'; $('#msg').style.opacity='0';
+  document.getElementById('bLight')?.classList.add('active');
+  document.getElementById('bCrouch')?.classList.remove('active');
+  updateFuses(); updateGauges();
+}
+async function tryImmersive(){
+  if(!DEV.touch) return;
+  const cap=window.Capacitor&&window.Capacitor.Plugins;
+  try{
+    if(cap&&cap.ScreenOrientation) await cap.ScreenOrientation.lock({orientation:'landscape'});
+    else { await document.documentElement.requestFullscreen?.(); await screen.orientation?.lock?.('landscape'); }
+  }catch(_){}
+  try{ await navigator.wakeLock?.request('screen'); }catch(_){}
+  window.__chkOri&&window.__chkOri();
+}
+function beginPlay(){
+  Snd.resume(); Snd.startBed(); Snd.humOn(true);
+  resetGame(); hideAll(); G.state='play';
+  if(!DEV.touch) renderer.domElement.requestPointerLock?.();
+  showMsg('找齊 5 個保險絲',2.6);
+}
+$('#startBtn').onclick=()=>{ Snd.resume(); Snd.play('uiClick'); Haptics.fire('uiTap');
+  tryImmersive(); beginPlay(); };
+$('#resumeBtn').onclick=resume;
+$('#restartBtn').onclick=()=>{ Snd.play('uiClick'); beginPlay(); };
+$('#restartBtn2').onclick=()=>{ Snd.play('uiClick'); beginPlay(); };
+(function settings(){
+  const th=$('#tgHaptic'),tf=$('#tgFlicker'),ti=$('#tgInvert'),sn=$('#sens');
+  th.classList.toggle('on',Haptics.enabled);
+  if(!Haptics.available){ th.textContent='震動（不支援）'; th.style.opacity='.35'; }
+  tf.classList.toggle('on',P.flicker);
+  ti.classList.toggle('on',P.invert);
+  sn.value=String(Math.round(P.sens*10000));
+  th.onclick=()=>{ Haptics.enabled=!Haptics.enabled; th.classList.toggle('on',Haptics.enabled); };
+  tf.onclick=()=>{ P.flicker=!P.flicker; Store.set('ts_flicker',P.flicker?'1':'0');
+    tf.classList.toggle('on',P.flicker); };
+  ti.onclick=()=>{ P.invert=!P.invert; Store.set('ts_invert',P.invert?'1':'0');
+    ti.classList.toggle('on',P.invert); };
+  sn.oninput=()=>{ P.sens=Number(sn.value)/10000; Store.set('ts_sens',sn.value); };
+})();
+
+/* ── 動態解析度 ── */
+const DynRes={scale:1,acc:0,frames:0,cool:0};
+function tickDynRes(dt){
+  DynRes.acc+=1/Math.max(dt,0.001); DynRes.frames++;
+  if(DynRes.cool>0) DynRes.cool--;
+  if(DynRes.frames<60) return;
+  const fps=DynRes.acc/DynRes.frames; DynRes.acc=0; DynRes.frames=0;
+  if(DynRes.cool>0) return;
+  let n=DynRes.scale;
+  if(fps<45) n=Math.max(0.6,DynRes.scale-0.1);
+  else if(fps>58) n=Math.min(1,DynRes.scale+0.05);
+  if(n!==DynRes.scale){ DynRes.scale=n; DynRes.cool=90;
+    renderer.setPixelRatio(Math.min(devicePixelRatio,DEV.pixelCap)*n);
+    renderer.setSize(innerWidth,innerHeight);
+    if(composer) composer.setSize(innerWidth,innerHeight);
+  }
+}
+
+/* ═══════════════════════════════════════════════════
+   §M 主迴圈
+   ═══════════════════════════════════════════════════ */
+let last=performance.now();
+function tick(now){
+  requestAnimationFrame(tick);
+  const dtReal=Math.min((now-last)/1000,0.05); last=now;
+  const inStop=now<FX.hitStopUntil;
+  const dt=dtReal*(inStop?CONFIG.FEEL.hitStop:1);
+  G.t+=dt;
+
+  if(G.state==='play'){
+    G.elapsed+=dt;
+    updatePlayer(dt);
+    // 甦醒條件：150 秒（gamedev-horror §1 的無威脅期）
+    if(!S.active&&G.elapsed>=CONFIG.STALKER.wakeAtSec) wakeStalker();
+    updateStalker(dt);
+    // 危險度：距離 + 是否被追
+    const d=S.active?S.pos.distanceTo(player.position):999;
+    const near=clamp(1-(d-3)/16,0,1);
+    G.danger=S.active?clamp(near*(S.state==='chase'?1:0.55),0,1):0;
+    Snd.tick(dt,G.danger,Math.hypot(P.horiz.x,P.horiz.z)>0.3,P.crouch,P.run);
+    updateGauges();
+    // 暗角隨危險度加深
+    $('#vig').style.background=
+      `radial-gradient(ellipse at center,transparent ${40-G.danger*16}%,rgba(0,0,0,${0.74+G.danger*0.18}) 100%)`;
+  }
+
+  // 收集物浮動與旋轉
+  for(const f of fuses){ if(f.taken) continue;
+    f.ph+=dt; f.g.rotation.y+=dt*1.1; f.g.position.y=0.95+Math.sin(f.ph*1.6)*0.06; }
+  for(const b of batteries){ if(b.taken) continue;
+    b.ph+=dt; b.g.rotation.y+=dt*0.8; b.g.position.y=0.55+Math.sin(b.ph*1.3)*0.04; }
+  // 吊燈閃爍（部分）
+  for(const l of lamps){
+    if(!l.flick) continue;
+    l.ph+=dt;
+    const on=Math.sin(l.ph*7.3)>-0.75 && (P.flicker?Math.random()>0.02:true);
+    l.pl.intensity=on?16:1.8;
+    l.bulb.material.emissiveIntensity=on?2.6:0.3;
+  }
+
+  if(msgT>0){ msgT-=dtReal; if(msgT<=0) $('#msg').style.opacity='0'; }
+  const hv=parseFloat($('#hurt').style.opacity||'0');
+  if(hv>0&&G.state==='play') $('#hurt').style.opacity=String(Math.max(0,hv-dtReal*1.4));
+
+  tickDynRes(dtReal);
+  if(composer) composer.render(); else renderer.render(scene,camera);
+}
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+  if(composer) composer.setSize(innerWidth,innerHeight);
+});
+
+/* ── 啟動 ── */
+(function boot(){
+  try{
+    stalker=buildStalker();
+    genMaze(); buildLevel();
+    const best=Number(Store.get('ts_best')||0);
+    $('#bestLine').textContent=best?`最佳紀錄 ${best} 秒`:'';
+    if(DEV.touch){
+      $('#keyList').innerHTML=
+        '<b>左半螢幕</b><span>移動</span>'+
+        '<b>右半螢幕</b><span>環顧</span>'+
+        '<b>跑</b><span>奔跑（會發出聲音）</span>'+
+        '<b>蹲</b><span>蹲下（更安靜）</span>'+
+        '<b>燈</b><span>手電筒</span>'+
+        '<b>互動</b><span>拾取 / 躲藏</span>';
+    }
+    updateFuses(); updateGauges();
+    G.state='menu'; show('start');
+    requestAnimationFrame(t=>{ last=t; tick(t); });
+  }catch(err){
+    console.error(err);
+    $('#loadTxt').textContent='初始化失敗：'+err.message;
+  }
+})();
+</script>
+</body>
+</html>
