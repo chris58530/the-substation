@@ -250,13 +250,13 @@ const CONFIG = {
   PLAYER:{ walk:2.6, run:5.0, crouch:1.3, eye:1.62, eyeCrouch:0.95,
            accel:0.25, decel:0.15, stamina:100, staminaDrain:18, staminaRegen:12 },
   LIGHT:{ angle:0.52, intensity:42, dist:32, penumbra:0.6,
-          drain:1.2, regen:0.4, lowAt:20, lerp:0.18 },
+          drain:1.7, regen:0.35, lowAt:20, lerp:0.18 },
   CAM:{ lerp:0.15, bob:0.035, fov:72, fovRun:80 },
   FEEL:{ hitStop:0.05, hitStopMs:60, shake:0.35, shakeDecay:0.88 },
   STALKER:{ speed:4.5, hearWalk:8, hearRun:20, hearCrouch:3,
             visAngle:70, visDist:18, memory:10, catchDist:1.5,
-            wakeAtSec:150, wakeAtFuses:2, calmAfterEscape:40, minPeakGap:90 },
-  FUSES:5, BATTERIES:6, LOCKERS:8,
+            wakeAtSec:55, wakeAtFuses:2, calmAfterEscape:40, minPeakGap:90 },
+  FUSES:5, BATTERIES:4, LOCKERS:8,
 };
 const PAL=CONFIG.PAL;
 const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
@@ -397,7 +397,20 @@ const Snd=(()=>{
     uiClick(t){ osc('square',900,900,0.035,0.14,'ui',t); },
     gameOver(t){ [330,262,220,165].forEach((f,i)=>osc('sawtooth',f,f,1.5,0.2,'ui',t+i*0.22)); },
     victory(t){ [262,330,392,523].forEach((f,i)=>osc('sine',f,f,1.6,0.2,'ui',t+i*0.16)); },
-    /* [8] 環境循環 */
+    /* [8] 環境循環 + 氛圍事件 */
+    metalBang(t){ noise(0.22,0.34,'threat',t,{type:'bandpass',f0:1400,f1:180,Q:0.9});
+                  osc('sine',88,44,0.3,0.30,'threat',t); },
+    doorSlam(t){ noise(0.16,0.30,'threat',t,{type:'lowpass',f0:900,f1:120});
+                 osc('sine',70,40,0.22,0.26,'threat',t+0.02); },
+    whisper(t){ const s2=ctx.createBufferSource(); s2.buffer=nb(1.4);
+      const f=ctx.createBiquadFilter(); f.type='bandpass'; f.frequency.value=rand(900,1500); f.Q.value=7;
+      const g=ctx.createGain(); env(g,t,0.09,0.25,0.5,0.6);
+      const lfo=ctx.createOscillator(),lg=ctx.createGain();
+      lfo.frequency.value=rand(4,9); lg.gain.value=280; lfo.connect(lg); lg.connect(f.frequency); lfo.start(t);
+      s2.connect(f); f.connect(g); g.connect(bus.threat); s2.start(t); s2.stop(t+1.4); lfo.stop(t+1.4); },
+    lightBuzz(t){ osc('sawtooth',118,112,0.5,0.10,'amb',t);
+                  noise(0.4,0.07,'amb',t,{type:'highpass',f0:3200,f1:2200}); },
+    scrape(t){ noise(0.55,0.16,'threat',t,{type:'bandpass',f0:2400,f1:600,Q:3.5}); },
     pipeDrip(t){ osc('sine',rand(900,1500),rand(400,700),0.10,0.10,'amb',t); },
     distantStep(t){ noise(0.1,0.07,'amb',t,{type:'bandpass',f0:380,f1:210,Q:2.2}); },
   };
@@ -410,7 +423,7 @@ const Snd=(()=>{
     if(!ready||bed) return;
     const s=ctx.createBufferSource(); s.buffer=nb(4); s.loop=true;
     const f=ctx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=180;
-    bedGain=ctx.createGain(); bedGain.gain.value=0.05;
+    bedGain=ctx.createGain(); bedGain.gain.value=0.075;
     const lfo=ctx.createOscillator(),lg=ctx.createGain();
     lfo.frequency.value=0.07; lg.gain.value=0.018; lfo.connect(lg); lg.connect(bedGain.gain); lfo.start();
     s.connect(f); f.connect(bedGain); bedGain.connect(bus.amb); s.start(); bed=s;
@@ -432,12 +445,12 @@ const Snd=(()=>{
   function tick(dt,danger,moving,crouch,running){
     if(!ready) return;
     hbT-=dt;
-    if(danger>0.05&&hbT<=0){
-      const hz=lerp(1.0,2.2,clamp(danger,0,1));
+    if(danger>0.02&&hbT<=0){
+      const hz=lerp(0.85,2.3,clamp(danger,0,1));
       osc('sine',56,32,0.15,0.16+danger*0.3,'amb',ctx.currentTime);
       hbT=1/hz;
     }
-    if(Math.random()<dt*0.10) play('pipeDrip');
+    if(Math.random()<dt*0.22) play('pipeDrip');
   }
   return { init,resume,play,startBed,bedTo,humOn,tick, get ready(){return ready;},
            get t(){ return ctx?ctx.currentTime:0; } };
@@ -885,6 +898,43 @@ function buildLevel(){
       box.castShadow=true; level.add(box);
     }
   }
+  // ── 環境痕跡：暗示這裡發生過什麼，比直接展示威脅有效（gamedev-horror §5）──
+  {
+    const M_BLOOD=new THREE.MeshStandardMaterial({color:0x3d0b0b,roughness:0.55,
+      transparent:true,opacity:0.9,depthWrite:false});
+    const M_SCRATCH=new THREE.MeshStandardMaterial({color:0x171a1f,roughness:0.9,
+      transparent:true,opacity:0.85,depthWrite:false});
+    for(let i=0;i<16;i++){
+      const c=take(2), p=cellToWorld(c.x,c.y);
+      if(Math.random()<0.5){                       // 地面血跡（拖行痕）
+        const n=2+((Math.random()*3)|0);
+        for(let k=0;k<n;k++){
+          const b=new THREE.Mesh(new THREE.CircleGeometry(rand(0.18,0.5),10),M_BLOOD);
+          b.rotation.x=-Math.PI/2; b.rotation.z=Math.random()*6.28;
+          b.position.set(p.x+rand(-1.4,1.4)+k*0.35,0.016,p.z+rand(-1.4,1.4)+k*0.28);
+          b.scale.set(1,rand(0.5,1.6),1); level.add(b);
+        }
+      } else {                                     // 牆面抓痕（三道平行）
+        const ang=(Math.floor(Math.random()*4))*Math.PI/2;
+        for(let k=0;k<3;k++){
+          const sc2=new THREE.Mesh(new THREE.PlaneGeometry(0.035,rand(0.5,1.0)),M_SCRATCH);
+          sc2.position.set(p.x+Math.sin(ang)*(CELL/2-0.14)+Math.cos(ang)*(k-1)*0.08,
+                           rand(1.0,1.8),
+                           p.z+Math.cos(ang)*(CELL/2-0.14)-Math.sin(ang)*(k-1)*0.08);
+          sc2.rotation.y=ang+Math.PI; sc2.rotation.z=rand(-0.2,0.2); level.add(sc2);
+        }
+      }
+    }
+    // 翻倒的置物櫃：有東西經過這裡
+    for(let i=0;i<3;i++){
+      const c=take(2), p=cellToWorld(c.x,c.y);
+      const g=new THREE.Mesh(bevelBox(0.72,2.0,0.5),M_METAL);
+      g.position.set(p.x+rand(-0.8,0.8),0.26,p.z+rand(-0.8,0.8));
+      g.rotation.set(Math.PI/2*0.92,Math.random()*6.28,rand(-0.2,0.2));
+      g.castShadow=true; g.receiveShadow=true; level.add(g);
+    }
+  }
+
   // ── 出口門 ──
   const ec={x:N-1,y:N-1}, ep=cellToWorld(ec.x,ec.y);
   const door=new THREE.Group();
@@ -913,7 +963,7 @@ function buildLevel(){
 function buildStalker(){
   const skin=new THREE.MeshStandardMaterial({color:0x6e6a62,roughness:0.86,metalness:0.03});
   const dark=new THREE.MeshStandardMaterial({color:0x24252a,roughness:0.92,metalness:0.02});
-  const eyeM=new THREE.MeshStandardMaterial({color:0xffe9b0,emissive:0xffd070,emissiveIntensity:3.2,
+  const eyeM=new THREE.MeshStandardMaterial({color:0xffe9b0,emissive:0xffd070,emissiveIntensity:4.5,
     roughness:0.2});
   const root=new THREE.Group();
   const rig={};
@@ -1141,7 +1191,7 @@ function interact(){
     return; }
   const b=nearest(batteries,1.7);
   if(b){ b.taken=true; b.g.visible=false;
-    P.torch=Math.min(100,P.torch+38); P.torchDead=false;
+    P.torch=Math.min(100,P.torch+32); P.torchDead=false;
     Snd.play('batteryGet'); Haptics.fire('pickup'); showMsg('+ BATTERY',1.0); return; }
   const lk=nearestLocker(1.7);
   if(lk){ enterLocker(lk); return; }
@@ -1187,7 +1237,7 @@ function wakeStalker(){
   S.state='patrol'; S.target={...c};
   Snd.bedTo(0.0001,1.2);                  // 突然的安靜 = 預告
   setTimeout(()=>{ if(G.state==='play'){ Snd.play('stalkerRoar'); Haptics.fire('scare');
-    Snd.bedTo(0.05,2.5); showMsg('有東西醒了',2.4); G.scares++; G.lastPeak=G.elapsed; } },1600);
+    Snd.bedTo(0.075,2.5); showMsg('有東西醒了',2.4); G.scares++; G.lastPeak=G.elapsed; } },1600);
 }
 function playerNoiseRadius(){
   if(G.hiding) return 0;
@@ -1204,18 +1254,7 @@ function stalkerCanSee(){
   to.normalize();
   const fwd=new THREE.Vector3(Math.sin(stalker.root.rotation.y),0,Math.cos(stalker.root.rotation.y));
   if(Math.acos(clamp(fwd.dot(to),-1,1))>THREE.MathUtils.degToRad(CONFIG.STALKER.visAngle/2)) return false;
-  // 視線遮蔽：逐格檢查是否連通
-  const a=worldToCell(S.pos), b=worldToCell(player.position);
-  const steps=Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y));
-  for(let i=1;i<=steps;i++){
-    const cx=Math.round(lerp(a.x,b.x,i/steps)), cy=Math.round(lerp(a.y,b.y,i/steps));
-    const px=Math.round(lerp(a.x,b.x,(i-1)/steps)), py=Math.round(lerp(a.y,b.y,(i-1)/steps));
-    if(px===cx&&py===cy) continue;
-    if(px===cx){ if(!open(px,Math.min(py,cy),py<cy?'s':'n')) return false; }
-    else if(py===cy){ if(!open(Math.min(px,cx),py,px<cx?'e':'w')) return false; }
-    else return false;
-  }
-  return true;
+  return cellsVisible(worldToCell(S.pos),worldToCell(player.position));
 }
 let pathT=0;
 function updateStalker(dt){
@@ -1224,9 +1263,15 @@ function updateStalker(dt){
   const heard=playerNoiseRadius()>0 && S.pos.distanceTo(player.position)<playerNoiseRadius();
   const seen=stalkerCanSee();
 
+  const wasChase=S.state==='chase';
   if(seen||heard){
     S.state='chase'; S.lastSeen={...pc}; S.memT=CONFIG.STALKER.memory;
-    if(S.roarT<=0){ Snd.play('stalkerRoar'); S.roarT=rand(4,8);
+    if(!wasChase){                       // 首次被發現：視覺 + 聽覺 + 觸覺同時尖峰
+      Snd.play('stalkerRoar'); Snd.play('metalBang');
+      Snd.bedTo(0.0001,0.25); setTimeout(()=>Snd.bedTo(0.075,3),1800);
+      FX.shake=Math.max(FX.shake,0.30); flashScreen(0.22);
+      Haptics.fire('scare'); G.lastPeak=G.elapsed; S.roarT=rand(3,5);
+    } else if(S.roarT<=0){ Snd.play('stalkerRoar'); S.roarT=rand(3.5,7);
       if(seen) Haptics.fire('near'); }
   } else if(S.state==='chase'){
     S.memT-=dt;
@@ -1306,7 +1351,135 @@ function animStalker(dt,spd){
   }
   if(r.jaw) r.jaw.rotation.x=lerp(r.jaw.rotation.x,b.jaw.x+(S.state==='chase'?0.34:0.10),0.1);
   const pulse=1+Math.sin(S.phase*2.2)*0.2;
-  stalker.mat.eyeM.emissiveIntensity=3.2*pulse*(S.state==='chase'?1.5:1);
+  if(!Dir.eyeBoost) stalker.mat.eyeM.emissiveIntensity=3.2*pulse*(S.state==='chase'?1.5:1);
+}
+
+/* ═══════════════════════════════════════════════════
+   §J2 恐懼導演（gamedev-horror §1 §5）
+   空曠不等於緊張。無威脅期必須靠氛圍事件維持張力，
+   而且「暗示」比「展示」有效——優先用聲音、痕跡與一閃而過的輪廓。
+   ═══════════════════════════════════════════════════ */
+const Dir={ next:9, level:0, glimpseT:0, glimpsing:false, eyeBoost:false, outT:0, outLamps:[] };
+function cellsVisible(a,b){
+  const steps=Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y));
+  if(steps===0) return true;
+  for(let i=1;i<=steps;i++){
+    const cx=Math.round(lerp(a.x,b.x,i/steps)), cy=Math.round(lerp(a.y,b.y,i/steps));
+    const px=Math.round(lerp(a.x,b.x,(i-1)/steps)), py=Math.round(lerp(a.y,b.y,(i-1)/steps));
+    if(px===cx&&py===cy) continue;
+    if(px===cx){ if(!open(px,Math.min(py,cy),py<cy?'s':'n')) return false; }
+    else if(py===cy){ if(!open(Math.min(px,cx),py,px<cx?'e':'w')) return false; }
+    else return false;
+  }
+  return true;
+}
+// 找一個「玩家看得到」的格子：在前方視野內、視線無遮蔽。看不到的驚嚇等於沒有。
+function visibleCellNear(minD,maxD){
+  const pc=worldToCell(player.position);
+  const fwd2=new THREE.Vector3(); camera.getWorldDirection(fwd2); fwd2.y=0; fwd2.normalize();
+  const cands=[];
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++){
+    const d=Math.hypot(x-pc.x,y-pc.y);
+    if(d<minD||d>maxD) continue;
+    const w=cellToWorld(x,y);
+    const to=w.clone().sub(player.position); to.y=0;
+    if(to.length()<0.1) continue;
+    to.normalize();
+    if(to.dot(fwd2)<0.20) continue;              // 前方約 ±78 度內（迷宮裡條件太嚴會永遠找不到）
+    if(!cellsVisible(pc,{x,y})) continue;
+    cands.push({x,y,d});
+  }
+  if(!cands.length) return null;
+  // 取中段距離：太近會看清細節，太遠在黑暗中根本看不見
+  cands.sort((a,b)=>a.d-b.d);
+  const lo=Math.floor(cands.length*0.35), hi=Math.max(lo,Math.floor(cands.length*0.75));
+  return cands[lo+((Math.random()*(hi-lo+1))|0)];
+}
+function randomCellNear(minD,maxD){
+  const pc=worldToCell(player.position);
+  for(let i=0;i<40;i++){
+    const x=clamp(pc.x+((Math.random()*(2*maxD+1))|0)-maxD,0,N-1);
+    const y=clamp(pc.y+((Math.random()*(2*maxD+1))|0)-maxD,0,N-1);
+    const d=Math.hypot(x-pc.x,y-pc.y);
+    if(d>=minD&&d<=maxD) return {x,y};
+  }
+  return pc;
+}
+function spatial(name,cell,vol=1){
+  // 以距離衰減音量，讓玩家能大致判斷方向與遠近
+  const w=cellToWorld(cell.x,cell.y);
+  const d=w.distanceTo(player.position);
+  if(d>34) return;
+  Snd.play(name);
+}
+function fireDreadEvent(){
+  const L=Dir.level;
+  const pool=[
+    {k:'step',   w:3},
+    {k:'bang',   w:2},
+    {k:'whisper',w:1+L},
+    {k:'silence',w:1+L},
+    {k:'lights', w:1+L*0.6},
+    {k:'scrape', w:L*0.8},
+    {k:'glimpse',w:L*1.2},
+    {k:'door',   w:1.5},
+  ];
+  const tot=pool.reduce((a,b)=>a+b.w,0);
+  let r=Math.random()*tot, pick=pool[0];
+  for(const o of pool){ r-=o.w; if(r<=0){ pick=o; break; } }
+
+  switch(pick.k){
+    case 'step':    spatial('distantStep',randomCellNear(3,8));
+                    setTimeout(()=>Snd.play('distantStep'),320);
+                    setTimeout(()=>Snd.play('distantStep'),640); break;
+    case 'bang':    Snd.play('metalBang'); FX.shake=Math.max(FX.shake,0.06); break;
+    case 'whisper': Snd.play('whisper'); Haptics.fire('scare'); break;
+    case 'door':    Snd.play('doorSlam'); FX.shake=Math.max(FX.shake,0.05); break;
+    case 'scrape':  Snd.play('scrape'); break;
+    case 'silence': // 突然的安靜：最有效的預告
+      Snd.bedTo(0.0001,0.5);
+      setTimeout(()=>{ if(G.state==='play'){ Snd.play('metalBang'); Haptics.fire('scare');
+        FX.shake=Math.max(FX.shake,0.14); Snd.bedTo(0.075,2.2); G.scares++; } }, rand(2200,4200));
+      break;
+    case 'lights': { // 附近燈光同時熄滅數秒
+      const off=lamps.filter(l=>l.g.position.distanceTo(player.position)<16);
+      if(!off.length){ Snd.play('distantStep'); break; }
+      off.forEach(l=>{ l.dead=true; l.pl.intensity=0; l.bulb.material.emissiveIntensity=0.05; });
+      Snd.play('lightBuzz'); Dir.outLamps=off; Dir.outT=rand(3.5,6.5);
+      break; }
+    case 'glimpse': { // 遠處走廊盡頭一閃而過的輪廓——不展示，只暗示
+      if(S.active||Dir.glimpsing) { Snd.play('whisper'); break; }
+      const c=visibleCellNear(2,6)||visibleCellNear(1,9);
+      if(!c){ Snd.play('scrape'); break; }        // 看不到就別浪費這次事件
+      const w=cellToWorld(c.x,c.y);
+      stalker.root.position.set(w.x,0,w.z);
+      stalker.root.rotation.y=Math.atan2(player.position.x-w.x,player.position.z-w.z);
+      stalker.root.visible=true; Dir.glimpsing=true; Dir.glimpseT=rand(1.1,1.8);
+      stalker.mat.eyeM.emissiveIntensity=14;      // 黑暗中先看到兩顆眼睛
+      Dir.eyeBoost=true;
+      Snd.play('scrape'); Snd.play('whisper',0.25); Haptics.fire('scare'); G.scares++;
+      break; }
+  }
+}
+function updateDirector(dt){
+  if(G.state!=='play') return;
+  Dir.level=clamp(G.elapsed/90,0,3);
+  Dir.next-=dt;
+  if(Dir.next<=0){
+    fireDreadEvent();
+    // 間隔隨強度縮短：14~22 秒 → 7~12 秒
+    Dir.next=rand(14-Dir.level*2.4, 22-Dir.level*3.4);
+  }
+  if(Dir.glimpsing){
+    Dir.glimpseT-=dt;
+    if(Dir.glimpseT<=0){ Dir.glimpsing=false; Dir.eyeBoost=false;
+      stalker.mat.eyeM.emissiveIntensity=3.2;
+      if(!S.active) stalker.root.visible=false; }
+  }
+  if(Dir.outT>0){
+    Dir.outT-=dt;
+    if(Dir.outT<=0){ Dir.outLamps.forEach(l=>{ l.dead=false; }); Dir.outLamps=[]; Snd.play('lightBuzz'); }
+  }
 }
 
 /* ═══════════════════════════════════════════════════
@@ -1515,6 +1688,8 @@ function resetGame(){
   torch.intensity=0; bounce.intensity=0;
   G.elapsed=0; G.fuses=0; G.hiding=false; G.hideLocker=null;
   G.awake=false; G.escapes=0; G.scares=0; G.lastPeak=-999; G.danger=0;
+  Dir.next=9; Dir.level=0; Dir.glimpsing=false; Dir.glimpseT=0; Dir.outT=0;
+  Dir.outLamps.forEach(l=>l.dead=false); Dir.outLamps=[];
   S.active=false; S.state='idle'; S.lastSeen=null; S.memT=0; S.roarT=0; S.hunt=0;
   if(stalker) stalker.root.visible=false;
   FX.shake=0; $('#hurt').style.opacity='0'; $('#msg').style.opacity='0';
@@ -1592,12 +1767,17 @@ function tick(now){
     updatePlayer(dt);
     // 甦醒條件：150 秒（gamedev-horror §1 的無威脅期）
     if(!S.active&&G.elapsed>=CONFIG.STALKER.wakeAtSec) wakeStalker();
+    updateDirector(dt);
     updateStalker(dt);
     // 危險度：距離 + 是否被追
     const d=S.active?S.pos.distanceTo(player.position):999;
     const near=clamp(1-(d-3)/16,0,1);
     G.danger=S.active?clamp(near*(S.state==='chase'?1:0.55),0,1):0;
     Snd.tick(dt,G.danger,Math.hypot(P.horiz.x,P.horiz.z)>0.3,P.crouch,P.run);
+    if(S.state==='chase'&&G.danger>0.3){
+      P.breathT-=dt*2.2;
+      if(Math.random()<dt*0.7) Snd.play('whisper');
+    }
     updateGauges();
     // 暗角隨危險度加深
     $('#vig').style.background=
@@ -1611,6 +1791,7 @@ function tick(now){
     b.ph+=dt; b.g.rotation.y+=dt*0.8; b.g.position.y=0.55+Math.sin(b.ph*1.3)*0.04; }
   // 吊燈閃爍（部分）
   for(const l of lamps){
+    if(l.dead){ l.pl.intensity=0; l.bulb.material.emissiveIntensity=0.05; continue; }
     if(!l.flick) continue;
     l.ph+=dt;
     const on=Math.sin(l.ph*7.3)>-0.75 && (P.flicker?Math.random()>0.02:true);
